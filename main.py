@@ -92,7 +92,7 @@ def run_track1(
     dataset_config: str = DEFAULT_DATASET_CONFIG,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     optimizer_name: Literal["adamw8bit", "adamw_fused", "muon"] = "adamw8bit",
-    attn_implementation: Literal["flash_attention_2", "sdpa", "eager"] = "flash_attention_2",
+    attn_implementation: Literal["flex_attention", "flash_attention_2", "sdpa", "eager"] = "flex_attention",
     compile_model: bool = True,
     compile_mode: str = "max-autotune-no-cudagraphs",
     compile_warmup: bool = True,
@@ -114,6 +114,15 @@ def run_track1(
         from transformers import Qwen3_5ForConditionalGeneration as ModelClass
     except ImportError:
         from transformers import AutoModelForImageTextToText as ModelClass
+    if attn_implementation == "flex_attention":
+        try:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5PreTrainedModel
+
+            Qwen3_5PreTrainedModel._supports_flex_attn = True
+            ModelClass._supports_flex_attn = True
+            print("enabled qwen3.5 flex_attention support flag", flush=True)
+        except Exception as exc:
+            print(f"warning: could not enable qwen3.5 flex_attention support flag: {exc}", flush=True)
 
     if minutes <= 0:
         raise ValueError("--minutes must be positive")
@@ -125,8 +134,10 @@ def run_track1(
         raise ValueError("--eval-blocks must be positive")
     if optimizer_name not in {"adamw8bit", "adamw_fused", "muon"}:
         raise ValueError("--optimizer-name must be one of: adamw8bit, adamw_fused, muon")
-    if attn_implementation not in {"flash_attention_2", "sdpa", "eager"}:
-        raise ValueError("--attn-implementation must be one of: flash_attention_2, sdpa, eager")
+    if attn_implementation not in {"flex_attention", "flash_attention_2", "sdpa", "eager"}:
+        raise ValueError(
+            "--attn-implementation must be one of: flex_attention, flash_attention_2, sdpa, eager"
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Modal H100 training path")
 
@@ -597,7 +608,7 @@ def main(
     dataset_config: str = DEFAULT_DATASET_CONFIG,
     dataset_revision: str = DEFAULT_DATASET_REVISION,
     optimizer_name: str = "adamw8bit",
-    attn_implementation: str = "flash_attention_2",
+    attn_implementation: str = "flex_attention",
     compile_model: bool = True,
     compile_mode: str = "max-autotune-no-cudagraphs",
     compile_warmup: bool = True,
