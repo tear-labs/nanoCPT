@@ -1,13 +1,18 @@
 """nanoCPT: a Modal H100 speedrun for continued pretraining.
 
-Track 1 trains Qwen3.5-4B-Base on FineMath for a fixed wall-clock budget and
-scores the run by the drop in heldout next-token loss.
+Tracks train Qwen3.5-4B-Base on FineMath for a fixed wall-clock budget and
+score the run by the drop in heldout next-token loss.
+
+Track 1: 30-minute budget (default)
+Track 2: 5-minute sprint
+Track 3: 2-hour endurance
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,6 +28,12 @@ DEFAULT_MODEL_REVISION = "1001bb4d826a52d1f399e183466143f4da7b741b"
 DEFAULT_DATASET_ID = "HuggingFaceTB/finemath"
 DEFAULT_DATASET_CONFIG = "finemath-4plus"
 DEFAULT_DATASET_REVISION = "e92b25a616738fe95dc186b64dfb19f9c8525594"
+
+TRACKS: dict[str, dict[str, Any]] = {
+    "1": {"name": "30min", "default_minutes": 30.0, "record_dir": "records/track_1_30min"},
+    "2": {"name": "5min", "default_minutes": 5.0, "record_dir": "records/track_2_5min"},
+    "3": {"name": "2hr", "default_minutes": 120.0, "record_dir": "records/track_3_2hr"},
+}
 
 
 app = modal.App(APP_NAME)
@@ -98,6 +109,9 @@ def run_track1(
     compile_warmup: bool = True,
     save_final: bool = False,
     log_every: int = 5,
+    track: str = "1",
+    record_description: str = "",
+    record_contributors: str = "",
 ) -> dict[str, Any]:
     import datetime as dt
     import math
@@ -140,6 +154,10 @@ def run_track1(
         )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Modal H100 training path")
+    if track not in TRACKS:
+        raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
+
+    track_info = TRACKS[track]
 
     os.environ.setdefault("HF_HOME", str(HF_CACHE))
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -172,6 +190,10 @@ def run_track1(
 
     config = {
         "run_id": run_id,
+        "track": track,
+        "track_name": track_info["name"],
+        "record_description": record_description,
+        "record_contributors": record_contributors,
         "minutes": minutes,
         "seq_len": seq_len,
         "micro_batch_size": micro_batch_size,
@@ -588,13 +610,37 @@ def run_track1(
 
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=_json_default) + "\n")
     log_metric({"event": "summary", **summary})
+
+    if record_description:
+        record_dir = Path(track_info["record_dir"]) / f"{dt.date.today().isoformat()}_{record_description.replace(' ', '_')}"
+        record_dir.mkdir(parents=True, exist_ok=True)
+        (record_dir / "config.json").write_text(json.dumps(config, indent=2, default=_json_default) + "\n")
+        (record_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=_json_default) + "\n")
+        src_path = Path(__file__).resolve()
+        shutil.copy2(src_path, record_dir / "main.py")
+        (record_dir / "record.txt").write_text(
+            f"Track {track} ({track_info['name']})\n"
+            f"Description: {record_description}\n"
+            f"Contributors: {record_contributors}\n"
+            f"Date: {dt.date.today().isoformat()}\n"
+            f"Minutes: {minutes}\n"
+            f"Eval loss drop: {summary['eval_loss_drop']:.6f}\n"
+            f"Baseline eval loss: {baseline_loss:.6f}\n"
+            f"Final eval loss: {final_loss:.6f}\n"
+            f"Steps: {step}\n"
+            f"Tokens: {tokens:,}\n"
+            f"Elapsed: {elapsed_train_seconds:.1f}s\n"
+            f"Tokens/sec: {summary['tokens_per_second']:.0f}\n"
+        )
+        print(f"record saved to {record_dir}", flush=True)
+
     cache_volume.commit()
     return summary
 
 
 @app.local_entrypoint()
 def main(
-    minutes: float = 30.0,
+    minutes: float = 0.0,
     seq_len: int = 4096,
     micro_batch_size: int = 1,
     grad_accum: int = 8,
@@ -614,8 +660,21 @@ def main(
     compile_warmup: bool = True,
     save_final: bool = False,
     log_every: int = 5,
+    track: str = "1",
+    record_description: str = "",
+    record_contributors: str = "",
 ) -> None:
-    """Run track 1 on Modal."""
+    """Run a nanoCPT track on Modal.
+
+    --track selects the competition track (1=30min, 2=5min, 3=2hr).
+    When --minutes is 0 (default), the track's default budget is used.
+    Set --record-description to save a competition record on success.
+    """
+
+    if minutes == 0.0:
+        if track not in TRACKS:
+            raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
+        minutes = TRACKS[track]["default_minutes"]
 
     summary = run_track1.remote(
         minutes=minutes,
@@ -638,5 +697,8 @@ def main(
         compile_warmup=compile_warmup,
         save_final=save_final,
         log_every=log_every,
+        track=track,
+        record_description=record_description,
+        record_contributors=record_contributors,
     )
     print(json.dumps(summary, indent=2, default=_json_default))
