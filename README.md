@@ -186,26 +186,21 @@ Open a PR with the new record folder. The PR should:
 
 ## Record history
 
-Current baseline status: the v1 LoRA run keeps
+Current baseline status: the v2 LoRA default keeps
 `compile_mode=max-autotune-no-cudagraphs`. CUDA graphs were tried with
 `max-autotune` and failed during the PEFT LoRA path with a CUDAGraph overwritten
-tensor error, so they are not part of the baseline. The v1 Track 1 run compiled
-and completed, but its eval loss drop was negative; treat it as a logged
-baseline iteration, not a valid competition record under the positive-loss-drop
-rule. This saved v1 snapshot predates the scoring cleanup that moved compile
-and warmup inside the timed budget; future comparable records should run on the
-current trainer.
-
-Default utilization check: run `20260521-214056` used the current auto path
-(`micro_batch_size=8`, `grad_accum=1`, LoRA checkpointing, flex attention,
-`max-autotune-no-cudagraphs`) for a 6 minute compile-in-budget run. It completed
-23 train steps with 753,664 tokens, 10,653 train-loop tok/s, 100% peak sampled
-GPU util, 79.26 GiB peak NVML memory used, and 667 W peak power.
+tensor error, so they are not part of the baseline. The v2 Track 1 run compiled,
+completed the full 64-block eval with `eval_micro_batch_size=2`, and sustained
+100% peak sampled GPU util, but its eval loss drop was negative; treat it as a
+logged baseline/utilization iteration, not a valid competition record under the
+positive-loss-drop rule. The older v1 snapshot predates the scoring cleanup that
+moved compile and warmup inside the timed budget.
 
 ### Track 1 — 30 minutes
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|-----------|-------------|------|-----|--------------|
+| v2 | -0.050513 | LoRA default util baseline (all-linear r32, AdamW fused, lr=2e-4, seq=4096, mb8/grad1, eval mb2, max-autotune-no-cudagraphs); 491 steps, 16.09M tokens, 8936.5 budget tok/s, 10727.2 train-loop tok/s, 100% peak sampled GPU util | 2026-05-21 | [summary](records/track_1_30min/2026-05-21_v2_LoRA_mb8_Track_1_30min_default_util/summary.json) | — |
 | v1 | -0.050743 | LoRA baseline (all-linear r32, AdamW fused, lr=2e-4, seq=4096, max-autotune-no-cudagraphs); 488 steps, 15.99M tokens, 8872.6 tok/s | 2026-05-21 | [summary](records/track_1_30min/2026-05-21_v1_LoRA_Track_1_30min_compiled_baseline/summary.json) | — |
 
 ### Track 2 — 5 minutes
@@ -303,6 +298,8 @@ Modal image with:
 - `flash-linear-attention`, `causal-conv1d`, and `tilelang` for Qwen3.5 Gated DeltaNet layers
 - `peft` LoRA support; default mode applies all-linear rank-32 adapters before compile
   and auto-resolves to `micro_batch_size=8`, `grad_accum=1`, and checkpointing on H100
+- Eval uses a separate auto micro-batch cap of 2 blocks so the default training
+  batch does not OOM the full 64-block eval loss/logits path
 - Sequence packing from streamed FineMath documents into fixed `seq_len` blocks
 - `torch.compile(..., dynamic=False)` plus a train-shaped compile warmup inside the track budget
 - `optimizer_name="auto"` defaults to fused AdamW for LoRA and `AdamW8bit` for full fine-tuning

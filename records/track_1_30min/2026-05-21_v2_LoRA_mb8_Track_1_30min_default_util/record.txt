@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: v2 LoRA mb8 Track 1 30min default util
+Contributors: 
+Date: 2026-05-21
+Minutes: 30.0
+Eval loss drop: -0.050513
+Baseline eval loss: 1.431231
+Final eval loss: 1.481744
+Steps: 491
+Tokens: 16,089,088
+Elapsed budget: 1800.4s
+Budget tokens/sec: 8936
+Train-loop elapsed: 1499.8s
+Train-loop tokens/sec: 10727
