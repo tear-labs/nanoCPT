@@ -18,8 +18,9 @@ score = baseline_eval_loss − final_eval_loss
 ```
 
 Higher is better. The timer starts after model load, eval-cache prep,
-optimizer setup, an untimed train-shaped compile warmup, and baseline eval.
-The final eval runs after the timed train loop.
+optimizer setup, and baseline eval. Compilation, graph capture, autotuning, and
+train-shaped warmup all consume the selected track budget. The final eval runs
+after the timed train loop.
 
 The baseline iteration uses PEFT LoRA by default: all linear language-model
 layers get rank-32 adapters, the base checkpoint stays frozen, and full
@@ -59,9 +60,9 @@ New records must:
    that the mean eval loss drop is positive.
 5. **Run on a single H100 via Modal.** The hardware is fixed. The run must use
    the Modal image defined in `main.py`.
-6. **Not use any extra `torch._inductor.config` or `torch.compile` flags** that
-   cause compilation to exceed 30 minutes. (Standard `compile_mode` options are
-   fine.)
+6. **Count compilation work against the track budget.** `torch.compile`,
+   graph capture, autotuning, recompilation, and train-shaped compile warmup
+   are allowed, but they consume the same timed budget as training.
 7. **Beat the prior record.** When baselined on the same hardware, the new run
    must achieve a higher eval loss drop than the previous record.
 
@@ -185,11 +186,21 @@ Open a PR with the new record folder. The PR should:
 
 ## Record history
 
+Current baseline status: the v1 LoRA run keeps
+`compile_mode=max-autotune-no-cudagraphs`. CUDA graphs were tried with
+`max-autotune` and failed during the PEFT LoRA path with a CUDAGraph overwritten
+tensor error, so they are not part of the baseline. The v1 Track 1 run compiled
+and completed, but its eval loss drop was negative; treat it as a logged
+baseline iteration, not a valid competition record under the positive-loss-drop
+rule. This saved v1 snapshot predates the scoring cleanup that moved compile
+and warmup inside the timed budget; future comparable records should run on the
+current trainer.
+
 ### Track 1 — 30 minutes
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|-----------|-------------|------|-----|--------------|
-| 1 | — | LoRA baseline (all-linear r32, AdamW fused, lr=2e-4, seq=4096) | — | — | — |
+| v1 | -0.050743 | LoRA baseline (all-linear r32, AdamW fused, lr=2e-4, seq=4096, max-autotune-no-cudagraphs); 488 steps, 15.99M tokens, 8872.6 tok/s | 2026-05-21 | [summary](records/track_1_30min/2026-05-21_v1_LoRA_Track_1_30min_compiled_baseline/summary.json) | — |
 
 ### Track 2 — 5 minutes
 
@@ -267,9 +278,9 @@ Modal image with:
 - `flash-linear-attention`, `causal-conv1d`, and `tilelang` for Qwen3.5 Gated DeltaNet layers
 - `peft` LoRA support; default mode applies all-linear rank-32 adapters before compile
 - Sequence packing from streamed FineMath documents into fixed `seq_len` blocks
-- `torch.compile(..., dynamic=False)` plus an untimed train-shaped compile warmup
+- `torch.compile(..., dynamic=False)` plus a train-shaped compile warmup inside the track budget
 - `optimizer_name="auto"` defaults to fused AdamW for LoRA and `AdamW8bit` for full fine-tuning
-- LoRA `gradient_checkpointing="auto"` starts without checkpointing and retries the untimed warmup with checkpointing if CUDA OOMs
+- LoRA `gradient_checkpointing="auto"` starts without checkpointing and retries the timed warmup with checkpointing if CUDA OOMs
 - Optional Muon, with 2D matrix weights on Muon and embeddings/norms/biases/head on `AdamW8bit`
 
 Artifacts are written to the `nanofinetune-cache` Modal volume:
@@ -289,6 +300,7 @@ writes the canonical `records/` snapshot in this repository.
 score = baseline_eval_loss - final_eval_loss
 ```
 
-The timer starts after model load, eval-cache prep, optimizer setup, an untimed
-train-shaped compile warmup, and baseline eval. The final eval runs after the
-timed train loop.
+The timer starts after model load, eval-cache prep, optimizer setup, and
+baseline eval. Compilation, graph capture, autotuning, recompilation, and
+train-shaped compile warmup all consume the selected track budget. The final
+eval runs after the timed train loop.

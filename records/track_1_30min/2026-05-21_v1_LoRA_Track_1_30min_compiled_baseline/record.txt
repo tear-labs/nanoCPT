@@ -1,0 +1,12 @@
+Track 1 (30min)
+Description: v1 LoRA Track 1 30min compiled baseline
+Contributors: 
+Date: 2026-05-21
+Minutes: 30.0
+Eval loss drop: -0.050743
+Baseline eval loss: 1.432493
+Final eval loss: 1.483236
+Steps: 488
+Tokens: 15,990,784
+Elapsed: 1802.3s
+Tokens/sec: 8873

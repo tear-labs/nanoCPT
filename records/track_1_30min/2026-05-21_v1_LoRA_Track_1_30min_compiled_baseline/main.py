@@ -100,10 +100,8 @@ def _format_record_text(summary: dict[str, Any]) -> str:
         f"Final eval loss: {summary['final_eval_loss']:.6f}\n"
         f"Steps: {summary['steps']}\n"
         f"Tokens: {summary['tokens']:,}\n"
-        f"Elapsed budget: {summary['elapsed_budget_seconds']:.1f}s\n"
-        f"Budget tokens/sec: {summary['tokens_per_second']:.0f}\n"
-        f"Train-loop elapsed: {summary['elapsed_train_loop_seconds']:.1f}s\n"
-        f"Train-loop tokens/sec: {summary['train_loop_tokens_per_second']:.0f}\n"
+        f"Elapsed: {summary['elapsed_train_seconds']:.1f}s\n"
+        f"Tokens/sec: {summary['tokens_per_second']:.0f}\n"
     )
 
 
@@ -478,6 +476,10 @@ def run_track1(
     model.to(device)
     uncompiled_model = model
 
+    if compile_model:
+        print(f"compiling model with torch.compile(mode={compile_mode!r})", flush=True)
+        model = torch.compile(model, dynamic=False, mode=compile_mode)
+
     named_trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     trainable_params = [p for _, p in named_trainable_params]
     if not trainable_params:
@@ -647,6 +649,13 @@ def run_track1(
             return
         optimizer.step()
 
+    def mark_cudagraph_step() -> None:
+        if "no-cudagraph" in compile_mode:
+            return
+        mark_step = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+        if mark_step is not None:
+            mark_step()
+
     @torch.no_grad()
     def evaluate(label: str) -> float:
         model.eval()
@@ -654,6 +663,7 @@ def run_track1(
         for start in range(0, eval_blocks, micro_batch_size):
             batch = eval_input_ids[start : start + micro_batch_size].to(device, non_blocking=True)
             attention_mask = torch.ones_like(batch, dtype=torch.long)
+            mark_cudagraph_step()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
             losses.append(float(output.loss.detach().cpu()))
@@ -695,11 +705,12 @@ def run_track1(
         total_count = sum(p.numel() for p in model.parameters())
 
     def run_train_warmup() -> None:
-        print("running train/compile warmup", flush=True)
+        print("running untimed train/compile warmup", flush=True)
         model.train()
         optimizer_zero_grad()
         for _ in range(grad_accum):
             warmup_batch = next(batch_iter).to(device, non_blocking=True)
+            mark_cudagraph_step()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 warmup_loss = model(
                     input_ids=warmup_batch,
@@ -710,14 +721,6 @@ def run_track1(
             warmup_loss.backward()
         optimizer_zero_grad()
         torch.cuda.synchronize()
-
-    baseline_loss = evaluate("baseline_eval")
-    budget_start = time.monotonic()
-    train_deadline = budget_start + minutes * 60.0
-
-    if compile_model:
-        print(f"compiling model with torch.compile(mode={compile_mode!r})", flush=True)
-        model = torch.compile(model, dynamic=False, mode=compile_mode)
 
     if compile_warmup:
         try:
@@ -732,7 +735,7 @@ def run_track1(
                 raise
             print(
                 "LoRA warmup OOM without gradient checkpointing; "
-                "retrying warmup with checkpointing enabled",
+                "retrying untimed warmup with checkpointing enabled",
                 flush=True,
             )
             gradient_checkpointing_fallback_used = True
@@ -755,8 +758,10 @@ def run_track1(
             write_config()
             run_train_warmup()
 
+    baseline_loss = evaluate("baseline_eval")
+    train_start = time.monotonic()
+    train_deadline = train_start + minutes * 60.0
     optimizer_zero_grad()
-    train_loop_start = time.monotonic()
 
     step = 0
     tokens = 0
@@ -767,6 +772,7 @@ def run_track1(
         for _ in range(grad_accum):
             batch = next(batch_iter).to(device, non_blocking=True)
             attention_mask = torch.ones_like(batch, dtype=torch.long)
+            mark_cudagraph_step()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
                 loss = output.loss / grad_accum
@@ -782,9 +788,7 @@ def run_track1(
         last_loss = float(np.mean(accum_losses))
 
         if log_every > 0 and (step == 1 or step % log_every == 0):
-            now = time.monotonic()
-            elapsed_budget_seconds = now - budget_start
-            elapsed_train_loop_seconds = now - train_loop_start
+            elapsed = time.monotonic() - train_start
             log_metric(
                 {
                     "event": "train",
@@ -792,15 +796,12 @@ def run_track1(
                     "train_loss": last_loss,
                     "lr": step_lr,
                     "tokens": tokens,
-                    "elapsed_budget_seconds": elapsed_budget_seconds,
-                    "elapsed_train_loop_seconds": elapsed_train_loop_seconds,
-                    "tokens_per_second": tokens / max(elapsed_budget_seconds, 1.0e-9),
-                    "train_loop_tokens_per_second": tokens / max(elapsed_train_loop_seconds, 1.0e-9),
+                    "elapsed_train_seconds": elapsed,
+                    "tokens_per_second": tokens / max(elapsed, 1.0e-9),
                 }
             )
 
-    elapsed_budget_seconds = time.monotonic() - budget_start
-    elapsed_train_loop_seconds = time.monotonic() - train_loop_start
+    elapsed_train_seconds = time.monotonic() - train_start
     final_loss = evaluate("final_eval")
     summary = {
         **config,
@@ -812,11 +813,8 @@ def run_track1(
         "total_params": total_count,
         "steps": step,
         "tokens": tokens,
-        "elapsed_budget_seconds": elapsed_budget_seconds,
-        "elapsed_train_loop_seconds": elapsed_train_loop_seconds,
-        "elapsed_train_seconds": elapsed_budget_seconds,
-        "tokens_per_second": tokens / max(elapsed_budget_seconds, 1.0e-9),
-        "train_loop_tokens_per_second": tokens / max(elapsed_train_loop_seconds, 1.0e-9),
+        "elapsed_train_seconds": elapsed_train_seconds,
+        "tokens_per_second": tokens / max(elapsed_train_seconds, 1.0e-9),
         "last_train_loss": last_loss,
         "baseline_eval_loss": baseline_loss,
         "final_eval_loss": final_loss,
