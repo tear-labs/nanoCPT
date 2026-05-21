@@ -1,7 +1,7 @@
 [project]
-name = "nanocpt"
+name = "nanofinetune"
 version = "0.1.0"
-description = "Single-H100 continued-pretraining speedrun on Modal."
+description = "Single-H100 fine-tuning speedrun on Modal."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

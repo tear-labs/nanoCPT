@@ -1,16 +1,17 @@
-# nanoCPT
+# nanoFineTune
 
-Competitive continued-pretraining speedrun on Modal H100s.
+Competitive single-H100 fine-tuning speedrun on Modal.
 
 Inspired by [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).
 
 ## What
 
-nanoCPT measures how far a pretrained language model's heldout eval loss can
-drop during a fixed wall-clock training window on a single H100 GPU.
+nanoFineTune measures how far a pretrained language model's heldout eval loss
+can drop during a fixed wall-clock fine-tuning window on a single H100 GPU.
 
-Each run starts from `Qwen/Qwen3.5-4B-Base`, continues pretraining on
-`HuggingFaceTB/finemath` (`finemath-4plus`), and is scored by:
+The current default track starts from `Qwen/Qwen3.5-4B-Base`, uses a
+continued-pretraining objective on `HuggingFaceTB/finemath`
+(`finemath-4plus`), and is scored by:
 
 ```
 score = baseline_eval_loss − final_eval_loss
@@ -47,16 +48,21 @@ New records must:
    `eval_blocks × seq_len` blocks) must remain identical. You may change
    `eval_blocks`, `seq_len`, or the eval batch size, but not the underlying
    stream of tokens.
-3. **Attain a positive eval loss drop.** `baseline_eval_loss - final_eval_loss`
+3. **Not reward hack against the fixed dataset or eval construction.** Changes
+   designed to exploit dataset quirks, memorized ordering, eval-set leakage, or
+   other source-specific shortcuts are not valid records. Future validation may
+   run submissions across multiple heldout datasets or dataset configs to catch
+   overfitting to a single source.
+4. **Attain a positive eval loss drop.** `baseline_eval_loss - final_eval_loss`
    must be > 0. Due to inter-run variance, submissions targeting a new record
    should provide enough run logs to attain statistical significance at p < 0.01
    that the mean eval loss drop is positive.
-4. **Run on a single H100 via Modal.** The hardware is fixed. The run must use
+5. **Run on a single H100 via Modal.** The hardware is fixed. The run must use
    the Modal image defined in `main.py`.
-5. **Not use any extra `torch._inductor.config` or `torch.compile` flags** that
+6. **Not use any extra `torch._inductor.config` or `torch.compile` flags** that
    cause compilation to exceed 30 minutes. (Standard `compile_mode` options are
    fine.)
-6. **Beat the prior record.** When baselined on the same hardware, the new run
+7. **Beat the prior record.** When baselined on the same hardware, the new run
    must achieve a higher eval loss drop than the previous record.
 
 Other than that, anything and everything is fair game:
@@ -256,7 +262,7 @@ Modal image with:
 - LoRA `gradient_checkpointing="auto"` starts without checkpointing and retries the untimed warmup with checkpointing if CUDA OOMs
 - Optional Muon, with 2D matrix weights on Muon and embeddings/norms/biases/head on `AdamW8bit`
 
-Artifacts are written to the `nanocpt-cache` Modal volume:
+Artifacts are written to the `nanofinetune-cache` Modal volume:
 
 - `/cache/runs/<run_id>/config.json`
 - `/cache/runs/<run_id>/metrics.jsonl`

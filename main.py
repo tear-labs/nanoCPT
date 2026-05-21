@@ -1,4 +1,4 @@
-"""nanoCPT: a Modal H100 speedrun for continued pretraining.
+"""nanoFineTune: a Modal H100 speedrun for fine-tuning.
 
 Tracks train Qwen3.5-4B-Base on FineMath for a fixed wall-clock budget and
 score the run by the drop in heldout next-token loss.
@@ -19,7 +19,7 @@ from typing import Any, Literal
 import modal
 
 
-APP_NAME = "nanocpt"
+APP_NAME = "nanofinetune"
 CACHE_MOUNT = Path("/cache")
 HF_CACHE = CACHE_MOUNT / "huggingface"
 
@@ -37,7 +37,7 @@ TRACKS: dict[str, dict[str, Any]] = {
 
 
 app = modal.App(APP_NAME)
-cache_volume = modal.Volume.from_name("nanocpt-cache", create_if_missing=True)
+cache_volume = modal.Volume.from_name("nanofinetune-cache", create_if_missing=True)
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
@@ -875,7 +875,7 @@ def main(
     record_description: str = "",
     record_contributors: str = "",
 ) -> None:
-    """Run a nanoCPT track on Modal.
+    """Run a nanoFineTune track on Modal.
 
     --track selects the competition track (1=30min, 2=5min, 3=2hr).
     When --minutes is 0 (default), the track's default budget is used.
