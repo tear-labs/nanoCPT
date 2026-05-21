@@ -220,6 +220,12 @@ current trainer.
 ./run.sh --minutes 30 --seq-len 4096 --micro-batch-size 1 --grad-accum 8
 ```
 
+Use `0` for automatic batch sizing. The safe default resolves to
+`--micro-batch-size 1 --grad-accum 8`, keeping 32k tokens per optimizer step.
+A LoRA `--micro-batch-size 2` smoke at `seq_len=4096` reached roughly 78 GiB
+in use and OOMed without checkpointing, so larger micro-batches should be
+treated as explicit experiments and watched through the GPU telemetry fields.
+
 Tuning modes:
 
 ```bash
@@ -260,6 +266,19 @@ Save final weights:
 In LoRA mode, `--save-final` writes adapter weights. In full mode, it writes
 the full model.
 
+Weights & Biases logging is opt-in:
+
+```bash
+export WANDB_API_KEY=...
+./run.sh track1 \
+  --wandb-project nanofinetune \
+  --wandb-tags lora,v1,track1
+```
+
+Use `--wandb-mode offline` to write W&B logs without an API key. Runs always
+write local JSONL metrics; when W&B is enabled, scalar train/eval/GPU metrics
+are mirrored to W&B.
+
 ## Architecture
 
 `main.py` is the canonical training source file. Like modded-nanogpt, new
@@ -281,6 +300,10 @@ Modal image with:
 - `torch.compile(..., dynamic=False)` plus a train-shaped compile warmup inside the track budget
 - `optimizer_name="auto"` defaults to fused AdamW for LoRA and `AdamW8bit` for full fine-tuning
 - LoRA `gradient_checkpointing="auto"` starts without checkpointing and retries the timed warmup with checkpointing if CUDA OOMs
+- GPU telemetry in `metrics.jsonl`, including NVML utilization, power, and CUDA
+  allocated/reserved/peak memory when available
+- Optional W&B logging via `--wandb-project`, with `WANDB_API_KEY` forwarded
+  from the local environment into the Modal function
 - Optional Muon, with 2D matrix weights on Muon and embeddings/norms/biases/head on `AdamW8bit`
 
 Artifacts are written to the `nanofinetune-cache` Modal volume:
@@ -303,4 +326,5 @@ score = baseline_eval_loss - final_eval_loss
 The timer starts after model load, eval-cache prep, optimizer setup, and
 baseline eval. Compilation, graph capture, autotuning, recompilation, and
 train-shaped compile warmup all consume the selected track budget. The final
-eval runs after the timed train loop.
+eval runs after the timed train loop. Baseline and final eval use the
+uncompiled module so post-budget eval does not create new compiled eval graphs.

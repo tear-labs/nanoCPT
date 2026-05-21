@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -28,6 +29,7 @@ DEFAULT_MODEL_REVISION = "1001bb4d826a52d1f399e183466143f4da7b741b"
 DEFAULT_DATASET_ID = "HuggingFaceTB/finemath"
 DEFAULT_DATASET_CONFIG = "finemath-4plus"
 DEFAULT_DATASET_REVISION = "e92b25a616738fe95dc186b64dfb19f9c8525594"
+DEFAULT_EFFECTIVE_TOKENS_PER_STEP = 32_768
 
 TRACKS: dict[str, dict[str, Any]] = {
     "1": {"name": "30min", "default_minutes": 30.0, "record_dir": "records/track_1_30min"},
@@ -38,6 +40,10 @@ TRACKS: dict[str, dict[str, Any]] = {
 
 app = modal.App(APP_NAME)
 cache_volume = modal.Volume.from_name("nanofinetune-cache", create_if_missing=True)
+wandb_secret_values = {"WANDB_API_KEY": os.environ.get("WANDB_API_KEY", "")}
+if os.environ.get("WANDB_BASE_URL"):
+    wandb_secret_values["WANDB_BASE_URL"] = os.environ["WANDB_BASE_URL"]
+wandb_env_secret = modal.Secret.from_dict(wandb_secret_values)
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
@@ -51,6 +57,7 @@ image = (
             "MAX_JOBS": "8",
             "NVCC_THREADS": "2",
             "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "TOKENIZERS_PARALLELISM": "true",
             "TORCH_CUDA_ARCH_LIST": "9.0",
         }
@@ -67,10 +74,12 @@ image = (
         "hf_transfer>=0.1.9",
         "huggingface_hub>=0.30.0",
         "numpy>=2.0.0",
+        "nvidia-ml-py>=12.560.30",
         "peft==0.19.1",
         "safetensors>=0.5.0",
         "tilelang",
         "tqdm>=4.66.0",
+        "wandb>=0.18.0",
         "git+https://github.com/huggingface/transformers.git",
         extra_options="--no-build-isolation",
     )
@@ -132,12 +141,13 @@ def _write_local_record(summary: dict[str, Any], artifacts: dict[str, str]) -> P
     gpu="H100",
     timeout=4 * 60 * 60,
     volumes={str(CACHE_MOUNT): cache_volume},
+    secrets=[wandb_env_secret],
 )
 def run_track1(
     minutes: float = 30.0,
     seq_len: int = 4096,
-    micro_batch_size: int = 1,
-    grad_accum: int = 8,
+    micro_batch_size: int = 0,
+    grad_accum: int = 0,
     lr: float = 0.0,
     weight_decay: float = -1.0,
     warmup_steps: int = 20,
@@ -162,6 +172,12 @@ def run_track1(
     compile_warmup: bool = True,
     save_final: bool = False,
     log_every: int = 5,
+    wandb_project: str = "",
+    wandb_entity: str = "",
+    wandb_name: str = "",
+    wandb_group: str = "",
+    wandb_tags: str = "",
+    wandb_mode: Literal["online", "offline", "disabled"] = "online",
     track: str = "1",
     record_description: str = "",
     record_contributors: str = "",
@@ -195,8 +211,8 @@ def run_track1(
         raise ValueError("--minutes must be positive")
     if seq_len < 128:
         raise ValueError("--seq-len must be at least 128")
-    if micro_batch_size < 1 or grad_accum < 1:
-        raise ValueError("--micro-batch-size and --grad-accum must be positive")
+    if micro_batch_size < 0 or grad_accum < 0:
+        raise ValueError("--micro-batch-size and --grad-accum must be non-negative; use 0 for auto")
     if eval_blocks < 1:
         raise ValueError("--eval-blocks must be positive")
     if warmup_steps < 0:
@@ -212,6 +228,8 @@ def run_track1(
         raise ValueError("--gradient-checkpointing must be one of: auto, true, false")
     if optimizer_name not in {"auto", "adamw8bit", "adamw_fused", "muon"}:
         raise ValueError("--optimizer-name must be one of: auto, adamw8bit, adamw_fused, muon")
+    if wandb_mode not in {"online", "offline", "disabled"}:
+        raise ValueError("--wandb-mode must be one of: online, offline, disabled")
     if lora_r < 1:
         raise ValueError("--lora-r must be positive")
     if lora_alpha < 1:
@@ -228,9 +246,18 @@ def run_track1(
         raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
 
     track_info = TRACKS[track]
+    requested_micro_batch_size = micro_batch_size
+    requested_grad_accum = grad_accum
+    if micro_batch_size == 0:
+        micro_batch_size = 1
+    if grad_accum == 0:
+        tokens_per_micro_batch = seq_len * micro_batch_size
+        grad_accum = max(1, DEFAULT_EFFECTIVE_TOKENS_PER_STEP // tokens_per_micro_batch)
     requested_lr = lr
     requested_weight_decay = weight_decay
     requested_optimizer_name = optimizer_name
+    wandb_tags_list = [tag.strip() for tag in wandb_tags.split(",") if tag.strip()]
+    wandb_enabled = bool(wandb_project) and wandb_mode != "disabled"
     lr = lr if lr > 0.0 else (2.0e-4 if tuning_mode == "lora" else 2.0e-5)
     weight_decay = weight_decay if weight_decay >= 0.0 else (0.01 if tuning_mode == "lora" else 0.1)
     resolved_optimizer_name = (
@@ -249,6 +276,7 @@ def run_track1(
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     try:
         import torch._dynamo as dynamo
 
@@ -274,6 +302,67 @@ def run_track1(
     eval_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
 
+    bytes_per_gib = 1024**3
+    gpu_index = torch.cuda.current_device()
+    gpu_props = torch.cuda.get_device_properties(gpu_index)
+    gpu_name = torch.cuda.get_device_name(gpu_index)
+    nvml = None
+    nvml_handle = None
+    nvml_error = ""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        nvml = pynvml
+        nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+    except Exception as exc:
+        nvml_error = str(exc)
+
+    def collect_gpu_stats() -> dict[str, Any]:
+        stats: dict[str, Any] = {}
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_index)
+            allocated = torch.cuda.memory_allocated(gpu_index)
+            reserved = torch.cuda.memory_reserved(gpu_index)
+            peak_allocated = torch.cuda.max_memory_allocated(gpu_index)
+            peak_reserved = torch.cuda.max_memory_reserved(gpu_index)
+            stats.update(
+                {
+                    "cuda_memory_allocated_gib": allocated / bytes_per_gib,
+                    "cuda_memory_reserved_gib": reserved / bytes_per_gib,
+                    "cuda_max_memory_allocated_gib": peak_allocated / bytes_per_gib,
+                    "cuda_max_memory_reserved_gib": peak_reserved / bytes_per_gib,
+                    "cuda_memory_free_gib": free_bytes / bytes_per_gib,
+                    "cuda_memory_total_gib": total_bytes / bytes_per_gib,
+                    "cuda_memory_reserved_fraction": reserved / max(total_bytes, 1),
+                    "cuda_max_memory_reserved_fraction": peak_reserved / max(total_bytes, 1),
+                    "cuda_max_memory_allocated_fraction": peak_allocated / max(total_bytes, 1),
+                }
+            )
+        except Exception as exc:
+            stats["cuda_memory_stats_error"] = str(exc)
+
+        if nvml is not None and nvml_handle is not None:
+            try:
+                memory_info = nvml.nvmlDeviceGetMemoryInfo(nvml_handle)
+                utilization = nvml.nvmlDeviceGetUtilizationRates(nvml_handle)
+                power_watts = nvml.nvmlDeviceGetPowerUsage(nvml_handle) / 1000.0
+                stats.update(
+                    {
+                        "gpu_utilization_percent": utilization.gpu,
+                        "gpu_memory_utilization_percent": utilization.memory,
+                        "gpu_memory_used_gib": memory_info.used / bytes_per_gib,
+                        "gpu_memory_total_gib": memory_info.total / bytes_per_gib,
+                        "gpu_memory_used_fraction": memory_info.used / max(memory_info.total, 1),
+                        "gpu_power_watts": power_watts,
+                    }
+                )
+            except Exception as exc:
+                stats["gpu_nvml_stats_error"] = str(exc)
+        elif nvml_error:
+            stats["gpu_nvml_init_error"] = nvml_error
+        return stats
+
     config = {
         "run_id": run_id,
         "track": track,
@@ -283,8 +372,13 @@ def run_track1(
         "minutes": minutes,
         "seq_len": seq_len,
         "micro_batch_size": micro_batch_size,
+        "requested_micro_batch_size": requested_micro_batch_size,
         "grad_accum": grad_accum,
+        "requested_grad_accum": requested_grad_accum,
         "effective_tokens_per_step": seq_len * micro_batch_size * grad_accum,
+        "target_effective_tokens_per_step": DEFAULT_EFFECTIVE_TOKENS_PER_STEP,
+        "gpu_name": gpu_name,
+        "gpu_total_memory_gib": gpu_props.total_memory / bytes_per_gib,
         "lr": lr,
         "requested_lr": requested_lr,
         "weight_decay": weight_decay,
@@ -313,6 +407,13 @@ def run_track1(
         "compile_mode": compile_mode,
         "compile_warmup": compile_warmup,
         "save_final": save_final,
+        "wandb_enabled": wandb_enabled,
+        "wandb_project": wandb_project,
+        "wandb_entity": wandb_entity,
+        "wandb_name": wandb_name,
+        "wandb_group": wandb_group,
+        "wandb_tags": wandb_tags_list,
+        "wandb_mode": wandb_mode,
     }
 
     def write_config() -> None:
@@ -320,11 +421,58 @@ def run_track1(
 
     write_config()
 
-    def log_metric(record: dict[str, Any]) -> None:
+    wandb_run = None
+
+    def wandb_log(record: dict[str, Any]) -> None:
+        if wandb_run is None:
+            return
+        payload: dict[str, int | float | bool] = {}
+        for key, value in record.items():
+            if key == "time":
+                continue
+            if isinstance(value, bool):
+                payload[key] = value
+            elif isinstance(value, int):
+                payload[key] = value
+            elif isinstance(value, float) and math.isfinite(value):
+                payload[key] = value
+        event = record.get("event")
+        if event in {"baseline_eval", "final_eval"} and isinstance(record.get("eval_loss"), (int, float)):
+            payload[f"{event}/eval_loss"] = float(record["eval_loss"])
+        if payload:
+            wandb_run.log(payload)
+
+    def log_metric(record: dict[str, Any], include_gpu: bool = False) -> None:
+        if include_gpu:
+            record = {**record, **collect_gpu_stats()}
         record = {"time": time.time(), **record}
         with metrics_path.open("a") as f:
             f.write(json.dumps(record, default=_json_default) + "\n")
         print(json.dumps(record, default=_json_default), flush=True)
+        wandb_log(record)
+
+    def log_gpu(label: str) -> None:
+        log_metric({"event": "gpu", "label": label}, include_gpu=True)
+
+    if wandb_enabled:
+        if wandb_mode == "online" and not os.environ.get("WANDB_API_KEY"):
+            raise RuntimeError(
+                "W&B online mode requires WANDB_API_KEY in the local environment before "
+                "running Modal, or use --wandb-mode offline"
+            )
+        import wandb
+
+        os.environ.setdefault("WANDB_DIR", str(run_dir))
+        wandb_run = wandb.init(
+            project=wandb_project,
+            entity=wandb_entity or None,
+            name=wandb_name or record_description or run_id,
+            group=wandb_group or f"track-{track}",
+            tags=wandb_tags_list,
+            config=config,
+            mode=wandb_mode,
+            dir=str(run_dir),
+        )
 
     def dataset_stream(shuffle: bool = False):
         ds = load_dataset(
@@ -477,6 +625,8 @@ def run_track1(
     device = torch.device("cuda")
     model.to(device)
     uncompiled_model = model
+    torch.cuda.synchronize()
+    log_gpu("after_model_to_cuda")
 
     named_trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     trainable_params = [p for _, p in named_trainable_params]
@@ -620,6 +770,8 @@ def run_track1(
             return torch.optim.AdamW(trainable_params, **kwargs)
 
     optimizer = make_optimizer()
+    torch.cuda.synchronize()
+    log_gpu("after_optimizer_init")
 
     def set_optimizer_lr(lr_value: float) -> None:
         if isinstance(optimizer, list):
@@ -658,7 +810,7 @@ def run_track1(
                 output = model(input_ids=batch, attention_mask=attention_mask, labels=batch, use_cache=False)
             losses.append(float(output.loss.detach().cpu()))
         loss = float(np.mean(losses))
-        log_metric({"event": label, "eval_loss": loss})
+        log_metric({"event": label, "eval_loss": loss}, include_gpu=True)
         model.train()
         set_visual_eval(model)
         return loss
@@ -714,6 +866,8 @@ def run_track1(
     baseline_loss = evaluate("baseline_eval")
     budget_start = time.monotonic()
     train_deadline = budget_start + minutes * 60.0
+    torch.cuda.reset_peak_memory_stats(gpu_index)
+    log_gpu("budget_start")
 
     if compile_model:
         print(f"compiling model with torch.compile(mode={compile_mode!r})", flush=True)
@@ -751,10 +905,13 @@ def run_track1(
                 model = torch.compile(model, dynamic=False, mode=compile_mode)
             refresh_trainable_params()
             optimizer = make_optimizer()
+            torch.cuda.synchronize()
+            log_gpu("after_optimizer_reinit")
             batch_iter = train_batches()
             write_config()
             run_train_warmup()
 
+    log_gpu("before_train_loop")
     optimizer_zero_grad()
     train_loop_start = time.monotonic()
 
@@ -796,11 +953,15 @@ def run_track1(
                     "elapsed_train_loop_seconds": elapsed_train_loop_seconds,
                     "tokens_per_second": tokens / max(elapsed_budget_seconds, 1.0e-9),
                     "train_loop_tokens_per_second": tokens / max(elapsed_train_loop_seconds, 1.0e-9),
-                }
+                },
+                include_gpu=True,
             )
 
-    elapsed_budget_seconds = time.monotonic() - budget_start
-    elapsed_train_loop_seconds = time.monotonic() - train_loop_start
+    budget_end = time.monotonic()
+    elapsed_budget_seconds = budget_end - budget_start
+    elapsed_train_loop_seconds = budget_end - train_loop_start
+    # Keep post-budget evaluation from triggering a new compiled eval graph.
+    model = uncompiled_model
     final_loss = evaluate("final_eval")
     summary = {
         **config,
@@ -835,6 +996,9 @@ def run_track1(
 
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=_json_default) + "\n")
     log_metric({"event": "summary", **summary})
+    if wandb_run is not None:
+        wandb_run.summary.update(summary)
+        wandb_run.finish()
 
     record_artifacts = None
     if record_description:
@@ -857,8 +1021,8 @@ def run_track1(
 def main(
     minutes: float = 0.0,
     seq_len: int = 4096,
-    micro_batch_size: int = 1,
-    grad_accum: int = 8,
+    micro_batch_size: int = 0,
+    grad_accum: int = 0,
     lr: float = 0.0,
     weight_decay: float = -1.0,
     warmup_steps: int = 20,
@@ -883,6 +1047,12 @@ def main(
     compile_warmup: bool = True,
     save_final: bool = False,
     log_every: int = 5,
+    wandb_project: str = "",
+    wandb_entity: str = "",
+    wandb_name: str = "",
+    wandb_group: str = "",
+    wandb_tags: str = "",
+    wandb_mode: str = "online",
     track: str = "1",
     record_description: str = "",
     record_contributors: str = "",
@@ -928,6 +1098,12 @@ def main(
         compile_warmup=compile_warmup,
         save_final=save_final,
         log_every=log_every,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        wandb_name=wandb_name,
+        wandb_group=wandb_group,
+        wandb_tags=wandb_tags,
+        wandb_mode=wandb_mode,  # type: ignore[arg-type]
         track=track,
         record_description=record_description,
         record_contributors=record_contributors,
