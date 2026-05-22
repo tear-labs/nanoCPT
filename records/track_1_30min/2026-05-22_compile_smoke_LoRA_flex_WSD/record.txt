@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: compile smoke LoRA+ flex WSD
+Contributors: 
+Date: 2026-05-22
+Minutes: 1.0
+Eval loss drop: 0.000000
+Baseline eval loss: 1.771197
+Final eval loss: 1.771197
+Steps: 0
+Tokens: 0
+Elapsed budget: 292.9s
+Budget tokens/sec: 0
+Train-loop elapsed: 0.0s
+Train-loop tokens/sec: 0

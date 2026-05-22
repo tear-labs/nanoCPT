@@ -222,10 +222,9 @@ moved compile and warmup inside the timed budget.
 ```
 
 Use `0` for automatic batch sizing. The safe default resolves to
-`--micro-batch-size 1 --grad-accum 8`, keeping 32k tokens per optimizer step.
-A LoRA `--micro-batch-size 2` smoke at `seq_len=4096` reached roughly 78 GiB
-in use and OOMed without checkpointing, so larger micro-batches should be
-treated as explicit experiments and watched through the GPU telemetry fields.
+`--micro-batch-size 8 --grad-accum 1` for LoRA on H100, keeping 32k tokens per
+optimizer step. Eval uses its own auto cap of `--eval-micro-batch-size 2` so
+the full 64-block eval does not OOM the loss/logits path.
 
 Tuning modes:
 
@@ -238,6 +237,10 @@ LoRA baseline knobs:
 
 ```bash
 ./run.sh --lora-r 32 --lora-alpha 64 --lora-target-modules all-linear
+./run.sh --lora-init pissa_niter_4
+./run.sh --lora-init olora
+./run.sh --lora-init eva --lora-eva-batches 16
+./run.sh --lora-use-dora
 ./run.sh --gradient-checkpointing true
 ./run.sh --gradient-checkpointing false
 ```
@@ -248,7 +251,17 @@ Optimizer choices:
 ./run.sh --optimizer-name auto
 ./run.sh --optimizer-name adamw8bit
 ./run.sh --optimizer-name adamw_fused
-./run.sh --optimizer-name muon
+./run.sh --optimizer-name loraplus_adamw --loraplus-lr-ratio 16
+./run.sh --optimizer-name loraplus_adamw8bit --loraplus-lr-ratio 16
+./run.sh --optimizer-name lorafa --lora-r 128 --lora-alpha 32
+./run.sh --optimizer-name muon --muon-lr-adjustment match_rms_adamw
+```
+
+Learning-rate schedule choices:
+
+```bash
+./run.sh --lr-schedule constant
+./run.sh --lr-schedule wsd --lr-decay-fraction 0.1 --min-lr-ratio 0.0
 ```
 
 Attention backends or disable compile:
@@ -280,6 +293,61 @@ Use `--wandb-mode offline` to write W&B logs without an API key. Runs always
 write local JSONL metrics; when W&B is enabled, scalar train/eval/GPU metrics
 are mirrored to W&B.
 
+## Iteration Notes
+
+### 2026-05-22 optimizer and LoRA variant pass
+
+The v2 utilization run fixed the GPU side but still worsened eval loss, so this
+iteration adds quality-oriented knobs without changing the default baseline:
+
+- LoRA+ optimizers (`loraplus_adamw`, `loraplus_adamw8bit`) keep separate base
+  learning rates for LoRA A/B matrices through warmup and decay. Explicit
+  LoRA+ runs default to `5e-5`; sweep `2e-5`, `5e-5`, and lower ratios before
+  trying `1e-4` again.
+- Muon now supports the Moonshot/PyTorch RMS-matched update scale via
+  `--muon-lr-adjustment match_rms_adamw`; compare `--lr 2e-4`, `5e-4`, and
+  `1e-3`.
+- LoRA initializers are selectable with `--lora-init`. Prioritize
+  `pissa_niter_4`, then `olora`; use `eva` only when the extra initialization
+  pass is worth measuring.
+- LoRA-FA is available for high-rank experiments where activation memory is the
+  limiter, e.g. `--optimizer-name lorafa --lora-r 128 --lora-alpha 32`.
+- WSD scheduling is available as an opt-in terminal decay:
+  `--lr-schedule wsd --lr-decay-fraction 0.1`.
+
+Implementation sources checked: [PEFT's LoRA guide](https://huggingface.co/docs/peft/developer_guides/lora)
+for PiSSA/OLoRA/EVA, DoRA, LoRA+, and LoRA-FA support;
+[PyTorch's Muon docs](https://docs.pytorch.org/docs/2.9/generated/torch.optim.Muon.html)
+for `match_rms_adamw`; the [LoRA+ paper](https://arxiv.org/abs/2402.12354);
+and WSD schedule work ([2410.05192](https://arxiv.org/abs/2410.05192),
+[2601.09000](https://arxiv.org/abs/2601.09000)).
+
+Validation results:
+
+| Run | Scope | Result |
+| --- | --- | --- |
+| `2026-05-22_smoke_LoRA_PiSSA_WSD` | LoRA+ AdamW, PiSSA, WSD, SDPA/no-compile | Passed one train step; peak util 100%, peak NVML 67.48 GiB. |
+| `2026-05-22_smoke_Muon_RMS_PiSSA_WSD` | Muon RMS, PiSSA, WSD, SDPA/no-compile | Passed one train step; peak util 100%, peak NVML 67.34 GiB. |
+| `2026-05-22_compile_smoke_LoRA_flex_WSD` | LoRA+ AdamW, flex attention, `max-autotune-no-cudagraphs` | Compile and warmup passed; 1-minute budget was consumed before train steps. |
+| `2026-05-22_v3_LoRA_PiSSA_WSD` | Full 30-minute Track 1, default LoRA batch, flex compile | 469 steps, 15.37M tokens, 8,529.7 budget tok/s, 10,554.6 train-loop tok/s, peak util 100%, peak NVML 63.70 GiB, eval loss worsened by 0.8602. |
+
+Conclusion: keep the v2 default (`optimizer_name=auto` -> fused AdamW,
+`micro_batch_size=8`, flex attention, `max-autotune-no-cudagraphs`). The new
+LoRA+/Muon/PiSSA/WSD paths compile and run, but LoRA+ ratio 16 at base LR
+`1e-4` is not a quality baseline for this task.
+
+Recommended next 30 minute runs:
+
+```bash
+uv run modal run main.py --minutes 30 --optimizer-name loraplus_adamw \
+  --loraplus-lr-ratio 16 --lr 5e-5 --lora-init pissa_niter_4 \
+  --lr-schedule wsd --record-description "v4 LoRA+ PiSSA WSD lr5e-5"
+
+uv run modal run main.py --minutes 30 --optimizer-name muon \
+  --muon-lr-adjustment match_rms_adamw --lr 2e-4 --lora-init pissa_niter_4 \
+  --lr-schedule wsd --record-description "v4 Muon RMS PiSSA WSD lr2e-4"
+```
+
 ## Architecture
 
 `main.py` is the canonical training source file. Like modded-nanogpt, new
@@ -298,11 +366,15 @@ Modal image with:
 - `flash-linear-attention`, `causal-conv1d`, and `tilelang` for Qwen3.5 Gated DeltaNet layers
 - `peft` LoRA support; default mode applies all-linear rank-32 adapters before compile
   and auto-resolves to `micro_batch_size=8`, `grad_accum=1`, and checkpointing on H100
+- LoRA variant knobs for rsLoRA, DoRA, PiSSA/OLoRA/EVA/orthogonal initialization,
+  LoRA+, and LoRA-FA
 - Eval uses a separate auto micro-batch cap of 2 blocks so the default training
   batch does not OOM the full 64-block eval loss/logits path
 - Sequence packing from streamed FineMath documents into fixed `seq_len` blocks
 - `torch.compile(..., dynamic=False)` plus a train-shaped compile warmup inside the track budget
 - `optimizer_name="auto"` defaults to fused AdamW for LoRA and `AdamW8bit` for full fine-tuning
+- Optional WSD LR scheduling keeps the warmup/plateau behavior and decays only
+  near the end of the budget
 - LoRA `gradient_checkpointing="auto"` enables checkpointing for multi-sample micro-batches
   and still retries the timed warmup with checkpointing if CUDA OOMs
 - GPU telemetry in `metrics.jsonl`, including NVML utilization, power, and CUDA
@@ -310,7 +382,8 @@ Modal image with:
   mirrored into `summary.json` and W&B
 - Optional W&B logging via `--wandb-project`, with `WANDB_API_KEY` forwarded
   from the local environment into the Modal function
-- Optional Muon, with 2D matrix weights on Muon and embeddings/norms/biases/head on `AdamW8bit`
+- Optional Muon, with 2D matrix weights on Muon, embeddings/norms/biases/head on
+  `AdamW8bit`, and selectable original or RMS-matched LR scaling
 
 The cheap `./run.sh smoke` path pins SDPA/no-compile smoke tests to
 `micro_batch_size=4`; the larger `micro_batch_size=8` default is intended for

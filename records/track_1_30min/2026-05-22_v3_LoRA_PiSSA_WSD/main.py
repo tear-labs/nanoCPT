@@ -355,6 +355,10 @@ def run_track1(
     requested_lr = lr
     requested_weight_decay = weight_decay
     requested_optimizer_name = optimizer_name
+    wandb_tags_list = [tag.strip() for tag in wandb_tags.split(",") if tag.strip()]
+    wandb_enabled = bool(wandb_project) and wandb_mode != "disabled"
+    lr = lr if lr > 0.0 else (2.0e-4 if tuning_mode == "lora" else 2.0e-5)
+    weight_decay = weight_decay if weight_decay >= 0.0 else (0.01 if tuning_mode == "lora" else 0.1)
     resolved_optimizer_name = (
         "adamw_fused"
         if optimizer_name == "auto" and tuning_mode == "lora"
@@ -362,16 +366,6 @@ def run_track1(
         if optimizer_name == "auto"
         else optimizer_name
     )
-    wandb_tags_list = [tag.strip() for tag in wandb_tags.split(",") if tag.strip()]
-    wandb_enabled = bool(wandb_project) and wandb_mode != "disabled"
-    if lr <= 0.0:
-        if tuning_mode == "lora" and resolved_optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit"}:
-            lr = 5.0e-5
-        elif tuning_mode == "lora":
-            lr = 2.0e-4
-        else:
-            lr = 2.0e-5
-    weight_decay = weight_decay if weight_decay >= 0.0 else (0.01 if tuning_mode == "lora" else 0.1)
     checkpointing_enabled = gradient_checkpointing == "true" or (
         gradient_checkpointing == "auto"
         and (tuning_mode == "full" or (tuning_mode == "lora" and micro_batch_size > 1))

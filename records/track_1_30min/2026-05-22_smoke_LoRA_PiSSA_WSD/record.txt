@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: smoke LoRA+ PiSSA WSD
+Contributors: 
+Date: 2026-05-22
+Minutes: 0.1
+Eval loss drop: -0.044761
+Baseline eval loss: 1.771619
+Final eval loss: 1.816379
+Steps: 1
+Tokens: 16,384
+Elapsed budget: 72.9s
+Budget tokens/sec: 225
+Train-loop elapsed: 72.9s
+Train-loop tokens/sec: 225

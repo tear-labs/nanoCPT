@@ -1,0 +1,14 @@
+Track 1 (30min)
+Description: smoke Muon RMS PiSSA WSD
+Contributors: 
+Date: 2026-05-22
+Minutes: 0.1
+Eval loss drop: 0.001893
+Baseline eval loss: 1.771619
+Final eval loss: 1.769726
+Steps: 1
+Tokens: 16,384
+Elapsed budget: 68.2s
+Budget tokens/sec: 240
+Train-loop elapsed: 68.2s
+Train-loop tokens/sec: 240
