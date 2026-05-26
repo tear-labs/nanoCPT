@@ -559,6 +559,37 @@ When `--record-description` is provided, `main.py` also returns the source,
 config, summary, record text, and metrics log to the local entrypoint, which
 writes the canonical `records/` snapshot in this repository.
 
+## Citations
+
+GitHub uses `CITATION.cff` for the project-level citation UI. Individual run
+citations are generated in `citations/records.bib`; every
+`records/**/summary.json` gets a stable BibTeX key, including exploratory or
+negative runs. Use the entry for the exact run or leaderboard result you cite.
+
+Regenerate citation files after adding records or Markdown paper links:
+
+```bash
+uv run python scripts/generate_citations.py --write
+```
+
+Resolve new DOI/arXiv links in Markdown into `references.bib` and
+`REFERENCES.md`:
+
+```bash
+uv run python scripts/generate_citations.py --write --refresh-references
+```
+
+Check that generated citation files are current:
+
+```bash
+uv run python scripts/generate_citations.py --check
+```
+
+If a run later receives a DOI from a GitHub/Zenodo release, add it to
+`citations/doi-overrides.json` under that run's BibTeX key and regenerate.
+Google Scholar pickup is not guaranteed for GitHub, BibTeX, or Zenodo records;
+these files make citations and archival metadata easy to consume.
+
 ## Scoring detail
 
 ```
