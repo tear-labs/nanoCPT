@@ -14,9 +14,30 @@ case "${1:-}" in
       --eval-blocks 2 \
       --micro-batch-size 4 \
       --grad-accum 1 \
+      --gradient-checkpointing auto \
       --no-compile-model \
       --no-compile-warmup \
       --attn-implementation sdpa \
+      "$@"
+    ;;
+  instant-smoke)
+    shift
+    exec "${cmd[@]}" \
+      --minutes 0.1 \
+      --eval-blocks 2 \
+      --micro-batch-size 4 \
+      --grad-accum 1 \
+      --gradient-checkpointing auto \
+      --no-compile-model \
+      --no-compile-warmup \
+      --attn-implementation sdpa \
+      --activation-compression-mode instant-linear \
+      --instant-projector-kind hadamard \
+      --instant-chunk-size 64 \
+      --instant-keep 32 \
+      --instant-min-hidden-dim 64 \
+      --instant-hadamard-backend piecewise \
+      --instant-parameter-gradient projected-lowpass \
       "$@"
     ;;
   cpt-smoke)
@@ -58,6 +79,20 @@ case "${1:-}" in
   track1)
     shift
     exec "${cmd[@]}" --track 1 "$@"
+    ;;
+  instant-track1)
+    shift
+    exec "${cmd[@]}" \
+      --track 1 \
+      --gradient-checkpointing auto \
+      --activation-compression-mode instant-linear \
+      --instant-projector-kind hadamard \
+      --instant-chunk-size 64 \
+      --instant-keep 32 \
+      --instant-min-hidden-dim 64 \
+      --instant-hadamard-backend piecewise \
+      --instant-parameter-gradient projected-lowpass \
+      "$@"
     ;;
   cpt-track1)
     shift

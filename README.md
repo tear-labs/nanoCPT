@@ -83,7 +83,7 @@ Legacy CPT records must:
    under the prior "compile counts" rule have `elapsed_budget_seconds`
    including compile; new records do not. `eval_loss_drop` is unaffected, but
    `tokens_per_second` and step counts are not directly comparable across the
-   rule change — tag records pre-/post-2026-05-27 accordingly.
+   rule change - tag records pre-/post-2026-05-27 accordingly.
 7. **Beat the prior record.** When baselined on the same hardware, the new run
    must achieve a higher eval loss drop than the previous record.
 
@@ -249,7 +249,62 @@ Open a PR with the new record folder. The PR should:
 ## Track 1 SFT Validation
 
 Track 1 now defaults to packed UltraChat general chat SFT plus GraLoRA. The
-2026-05-25 results below used the previous Hermes SFT default and are retained
+canonical INSTANT path is the projected-coefficient activation-storage path:
+Hadamard low-sequency projection over per-example token chunks, `chunk_size=64`,
+`keep=32`, bf16 coefficients, and no cross-sequence filtering. The exact
+merged-gradient path is retained only as a quality/control mode because it stores
+full activations and dense merged weights, so it is not a memory-saving INSTANT
+result.
+
+UltraChat 30-minute quality controls, seed 1337:
+
+| Row | Loss drop | Baseline | Final | Steps | Train-loop tok/s | Log |
+|---|---:|---:|---:|---:|---:|---|
+| baseline GraLoRA | `+0.035286` | `1.028145` | `0.992859` | 548 | 9,966 | [summary](records/track_1_30min/2026-05-27_baseline_block64_untimed_compile_benchmark_20260527/summary.json) |
+| exact-param-grad GraLoRA control | `+0.035276` | `1.028145` | `0.992869` | 545 | 9,917 | [summary](records/track_1_30min/2026-05-27_instant_exact_forced_refresh_benchmark_20260527/summary.json) |
+
+The exact-param-grad row validates the GraLoRA patching/custom-autograd path and
+matches baseline eval loss, but it is not the accepted memory path. Current
+canonical INSTANT runs use `--instant-parameter-gradient projected-lowpass`.
+SFT rows are padded to the effective pack block size before packing, and
+`main.py` asserts that no low-pass chunk crosses a sequence boundary.
+
+Both quality rows above used the default LoRA gradient checkpointing policy:
+`--gradient-checkpointing auto`, which enabled checkpointing for micro-batch 8.
+The train-loop throughput comparison there is therefore checkpointed baseline
+versus checkpointed instant-low-pass, not a no-checkpoint speed comparison.
+
+Projected/no-checkpoint memory probes from 2026-05-27:
+
+| Run | Micro-batch / grad-accum | Result | Notes |
+|---|---:|---|---|
+| baseline 4096 tokens | 1 / 1 | 46.15 GiB peak allocated | matched no-checkpoint control |
+| Hadamard 32/64 projected | 1 / 1 | 45.94 GiB peak allocated | only 0.21 GiB saved; 2x storage is too weak here |
+| Hadamard 16/64 projected | 1 / 1 | 42.98 GiB peak allocated | 3.16 GiB saved vs matched baseline |
+| Hadamard 16/64 projected | 2 / 4 | OOM | about 76.26 GiB allocated; 64 MiB request in FLA gated-delta forward |
+
+The projected 32/64 path is the canonical quality-preserving setting; 16/64 is a
+stronger compression ablation that clearly saves GPU memory relative to the
+matched baseline, but still did not have enough headroom to double `B*S` at 4096
+tokens without checkpointing. With checkpointing enabled, peak memory is
+dominated elsewhere and this activation-storage saving is mostly hidden, so
+capacity tests should use no-checkpoint probes and then spend the saved memory on
+larger packed sequence or batch shapes only when the probe has enough headroom.
+
+| Projection | Stop step | Last observed train loss | Train-loop tok/s | Notes |
+|---|---:|---:|---:|---|
+| Hadamard 16/64 | 65 | `1.7705` | — | 4x storage; stopped after drift repeated |
+| Hadamard 32/64 | 75 | `1.6273` | 8,339 | 2x storage; peak allocated about 60.0 GiB, reserved about 61.3 GiB |
+| Hadamard 32/128 | 80 | `1.8396` | 8,364 | 4x storage; larger block did not rescue loss |
+| Haar average 1/4 | 115 | `1.9203` | 8,855 | one coefficient per 4-token block; exactly averages each 4-token chunk |
+
+The instant path now includes Triton GraLoRA `k=2` mix/unmix kernels, an exact
+merged-forward adapter-gradient mode, a piecewise Hadamard/Haar projection kernel
+for the coefficient-cache experiment, and PyTorch fallbacks. The next acceptance
+bar is a projected-lowpass run that preserves eval loss, keeps peak memory below
+baseline, and then recovers throughput with a fused fast path.
+
+The 2026-05-25 results below used the previous Hermes SFT default and are retained
 as historical adapter-comparison logs:
 
 | Adapter | Loss drop | Baseline | Final | Steps | Supervised tokens | Log |
@@ -548,12 +603,14 @@ Modal image with:
   batch does not OOM the full 64-block eval loss/logits path
 - No-padding sequence packing from streamed SFT conversations or FineMath
   documents into fixed `seq_len` blocks (`stream_concat_no_padding`)
-- `torch.compile(..., dynamic=False)` plus a train-shaped compile warmup inside the track budget
+- `torch.compile(..., dynamic=False)` plus a train-shaped compile warmup before
+  the timed budget, with the untimed duration logged as
+  `elapsed_compile_warmup_seconds`
 - `optimizer_name="auto"` defaults to fused AdamW for LoRA and `AdamW8bit` for full fine-tuning
 - Optional LR scheduling supports constant, full-budget linear/cosine decay,
   and WSD terminal decay near the end of the budget
 - LoRA `gradient_checkpointing="auto"` enables checkpointing for multi-sample micro-batches
-  and still retries the timed warmup with checkpointing if CUDA OOMs
+  and still retries the untimed warmup with checkpointing if CUDA OOMs
 - GPU telemetry in `metrics.jsonl`, including NVML utilization, power, and CUDA
   allocated/reserved/peak memory when available; peak budget-phase util and memory are
   mirrored into `summary.json` and W&B
@@ -614,8 +671,10 @@ these files make citations and archival metadata easy to consume.
 score = baseline_eval_loss - final_eval_loss
 ```
 
-The timer starts after model load, eval-cache prep, optimizer setup, and
-baseline eval. Compilation, graph capture, autotuning, recompilation, and
-train-shaped compile warmup all consume the selected track budget. The final
-eval runs after the timed train loop. Baseline and final eval use the
-uncompiled module so post-budget eval does not create new compiled eval graphs.
+The timer starts after model load, eval-cache prep, optimizer setup, baseline
+eval, and the untimed compile/warmup prologue. Compilation, graph capture,
+autotuning, recompilation, and train-shaped compile warmup run before the
+selected track budget starts; `summary.json` records that prologue as
+`elapsed_compile_warmup_seconds`. The final eval runs after the timed train
+loop. Baseline and final eval use the uncompiled module so post-budget eval
+does not create new compiled eval graphs.

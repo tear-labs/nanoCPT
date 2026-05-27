@@ -17,7 +17,7 @@ import os
 import re
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import modal
 
@@ -68,6 +68,11 @@ MUON_LR_ADJUSTMENT_CHOICES = {"original", "match_rms_adamw"}
 LORA_INIT_CHOICES = {"default", "gaussian", "pissa", "olora", "eva", "orthogonal", "lora_ga"}
 LORA_GA_DIRECTION_CHOICES = {"ArBr", "A2rBr", "ArB2r", "random"}
 LORA_GA_SCALE_CHOICES = {"stable", "weight_svd", "gd_scale", "unit"}
+ACTIVATION_COMPRESSION_MODE_CHOICES = {"off", "instant-linear"}
+INSTANT_PROJECTOR_KIND_CHOICES = {"hadamard", "dct", "haar"}
+INSTANT_TARGET_MODULE_CHOICES = {"trainable", "adapter", "all"}
+INSTANT_HADAMARD_BACKEND_CHOICES = {"auto", "piecewise", "triton", "fast", "dense"}
+INSTANT_PARAMETER_GRADIENT_CHOICES = {"exact", "projected_lowpass"}
 
 PEAK_GPU_STAT_KEYS = {
     "cuda_max_memory_allocated_gib": "peak_cuda_memory_allocated_gib",
@@ -189,6 +194,56 @@ def _supervised_token_count(labels) -> int:
     return int((shifted != -100).sum())
 
 
+def _next_multiple(value: int, multiple: int) -> int:
+    if multiple <= 0:
+        return value
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _pad_sft_row_to_block_multiple(
+    input_ids: list[int],
+    labels: list[int],
+    *,
+    block_size: int,
+    pad_token_id: int,
+    seq_len: int,
+) -> tuple[list[int], list[int], list[int], int]:
+    if len(input_ids) != len(labels):
+        raise RuntimeError("SFT row has misaligned input_ids and labels")
+    row_ids = list(input_ids)
+    row_labels = list(labels)
+    attention_mask = [1] * len(row_ids)
+    if block_size <= 0:
+        return row_ids, row_labels, attention_mask, 0
+    if seq_len % block_size != 0:
+        raise ValueError("--seq-len must be a multiple of the SFT pack block size")
+    if len(row_ids) > seq_len:
+        raise ValueError("SFT row must be truncated before block padding")
+    padded_len = _next_multiple(len(row_ids), block_size)
+    if padded_len > seq_len:
+        raise ValueError("SFT block padding would exceed --seq-len")
+    pad_count = padded_len - len(row_ids)
+    if pad_count:
+        row_ids.extend([pad_token_id] * pad_count)
+        row_labels.extend([-100] * pad_count)
+        attention_mask.extend([0] * pad_count)
+    return row_ids, row_labels, attention_mask, pad_count
+
+
+def _assert_no_cross_sequence_lowpass_segments(segment_ids: list[int], block_size: int) -> None:
+    if block_size <= 0:
+        return
+    if len(segment_ids) % block_size != 0:
+        raise RuntimeError("low-pass segment buffer is not block aligned")
+    for start in range(0, len(segment_ids), block_size):
+        seen = {segment for segment in segment_ids[start : start + block_size] if segment >= 0}
+        if len(seen) > 1:
+            raise RuntimeError(
+                "low-pass block crosses SFT sequence boundary "
+                f"at token range [{start}, {start + block_size})"
+            )
+
+
 app = modal.App(APP_NAME)
 cache_volume = modal.Volume.from_name("modded-continued-training-cache", create_if_missing=True)
 wandb_secret_values = {"WANDB_API_KEY": os.environ.get("WANDB_API_KEY", "")}
@@ -234,6 +289,8 @@ image = (
         "git+https://github.com/huggingface/transformers.git",
         extra_options="--no-build-isolation",
     )
+    .add_local_file(Path(__file__).with_name("instant_lowpass.py"), "/root/instant_lowpass.py")
+    .add_local_file(Path(__file__).with_name("instant_lowpass_triton.py"), "/root/instant_lowpass_triton.py")
 )
 
 
@@ -286,7 +343,15 @@ def _write_local_record(summary: dict[str, Any], artifacts: dict[str, str]) -> P
         record_dir = record_dir.with_name(f"{record_dir.name}_{summary['run_id']}")
     record_dir.mkdir(parents=True, exist_ok=False)
 
-    for filename in ("main.py", "config.json", "summary.json", "record.txt", "metrics.jsonl"):
+    for filename in (
+        "main.py",
+        "instant_lowpass.py",
+        "instant_lowpass_triton.py",
+        "config.json",
+        "summary.json",
+        "record.txt",
+        "metrics.jsonl",
+    ):
         content = artifacts.get(filename)
         if not content and filename == "main.py":
             content = Path(__file__).read_text()
@@ -319,6 +384,7 @@ def run_track1(
     dataset_config: str = "",
     dataset_revision: str = "",
     data_mode: str = "sft",
+    sft_pack_block_size: int = 0,
     tuning_mode: Literal["lora", "full"] = "lora",
     adapter_mode: str = "",
     optimizer_name: Literal[
@@ -333,6 +399,14 @@ def run_track1(
         "lorafa",
     ] = "auto",
     gradient_checkpointing: Literal["auto", "true", "false"] = "auto",
+    activation_compression_mode: Literal["off", "instant-linear"] = "off",
+    instant_projector_kind: Literal["hadamard", "dct", "haar"] = "hadamard",
+    instant_chunk_size: int = 64,
+    instant_keep: int = 32,
+    instant_min_hidden_dim: int = 64,
+    instant_hadamard_backend: Literal["auto", "piecewise", "triton", "fast", "dense"] = "auto",
+    instant_parameter_gradient: str = "projected_lowpass",
+    instant_target_modules: Literal["trainable", "adapter", "all"] = "trainable",
     lora_r: int = 32,
     lora_alpha: int = 64,
     lora_dropout: float = 0.0,
@@ -362,6 +436,7 @@ def run_track1(
     compile_model: bool = True,
     compile_mode: str = "max-autotune-no-cudagraphs",
     compile_warmup: bool = True,
+    memory_probe_steps: int = 0,
     save_final: bool = False,
     log_every: int = 5,
     wandb_project: str = "",
@@ -421,6 +496,8 @@ def run_track1(
     data_mode = str(data_mode or ("sft" if track == "1" else "cpt")).lower().replace("-", "_")
     if data_mode not in DATA_MODE_CHOICES:
         raise ValueError(f"--data-mode must be one of: {', '.join(sorted(DATA_MODE_CHOICES))}")
+    if sft_pack_block_size < 0:
+        raise ValueError("--sft-pack-block-size must be non-negative; use 0 for auto")
     tuning_mode = str(tuning_mode).lower()
     if tuning_mode not in {"lora", "full"}:
         raise ValueError("--tuning-mode must be one of: lora, full")
@@ -435,6 +512,48 @@ def run_track1(
     gradient_checkpointing = str(gradient_checkpointing).lower()
     if gradient_checkpointing not in {"auto", "true", "false"}:
         raise ValueError("--gradient-checkpointing must be one of: auto, true, false")
+    activation_compression_mode = str(activation_compression_mode).lower().replace("_", "-")
+    if activation_compression_mode in {"instant", "instantlinear"}:
+        activation_compression_mode = "instant-linear"
+    if activation_compression_mode not in ACTIVATION_COMPRESSION_MODE_CHOICES:
+        raise ValueError(
+            "--activation-compression-mode must be one of: "
+            f"{', '.join(sorted(ACTIVATION_COMPRESSION_MODE_CHOICES))}"
+        )
+    instant_projector_kind = str(instant_projector_kind).lower()
+    if instant_projector_kind not in INSTANT_PROJECTOR_KIND_CHOICES:
+        raise ValueError(
+            "--instant-projector-kind must be one of: "
+            f"{', '.join(sorted(INSTANT_PROJECTOR_KIND_CHOICES))}"
+        )
+    if instant_chunk_size < 1 or instant_chunk_size & (instant_chunk_size - 1):
+        raise ValueError("--instant-chunk-size must be a positive power of two")
+    if instant_keep < 1 or instant_keep > instant_chunk_size:
+        raise ValueError("--instant-keep must be in [1, instant-chunk-size]")
+    if instant_min_hidden_dim < 0:
+        raise ValueError("--instant-min-hidden-dim must be non-negative")
+    instant_hadamard_backend = str(instant_hadamard_backend).lower().replace("_", "-")
+    if instant_hadamard_backend not in INSTANT_HADAMARD_BACKEND_CHOICES:
+        raise ValueError(
+            "--instant-hadamard-backend must be one of: "
+            f"{', '.join(sorted(INSTANT_HADAMARD_BACKEND_CHOICES))}"
+        )
+    if instant_hadamard_backend in {"fast", "triton"}:
+        instant_hadamard_backend = "piecewise"
+    instant_parameter_gradient = str(instant_parameter_gradient).lower().replace("-", "_")
+    if instant_parameter_gradient in {"projected", "lowpass", "low_pass"}:
+        instant_parameter_gradient = "projected_lowpass"
+    if instant_parameter_gradient not in INSTANT_PARAMETER_GRADIENT_CHOICES:
+        raise ValueError(
+            "--instant-parameter-gradient must be one of: "
+            f"{', '.join(sorted(INSTANT_PARAMETER_GRADIENT_CHOICES))}"
+        )
+    instant_target_modules = str(instant_target_modules).lower().replace("_", "-")
+    if instant_target_modules not in INSTANT_TARGET_MODULE_CHOICES:
+        raise ValueError(
+            "--instant-target-modules must be one of: "
+            f"{', '.join(sorted(INSTANT_TARGET_MODULE_CHOICES))}"
+        )
     optimizer_name = str(optimizer_name).lower()
     if optimizer_name not in OPTIMIZER_CHOICES:
         raise ValueError(f"--optimizer-name must be one of: {', '.join(sorted(OPTIMIZER_CHOICES))}")
@@ -558,6 +677,32 @@ def run_track1(
         dataset_config,
         dataset_revision,
     )
+    requested_sft_pack_block_size = sft_pack_block_size
+    effective_sft_pack_block_size = 0
+    if data_mode == "sft":
+        effective_sft_pack_block_size = (
+            sft_pack_block_size
+            if sft_pack_block_size > 0
+            else instant_chunk_size
+            if activation_compression_mode == "instant-linear"
+            else 0
+        )
+        if effective_sft_pack_block_size < 0:
+            raise ValueError("--sft-pack-block-size must be non-negative; use 0 for auto")
+        if effective_sft_pack_block_size and seq_len % effective_sft_pack_block_size != 0:
+            raise ValueError("--seq-len must be a multiple of the effective SFT pack block size")
+        if (
+            activation_compression_mode == "instant-linear"
+            and effective_sft_pack_block_size % instant_chunk_size != 0
+        ):
+            raise ValueError(
+                "the effective SFT pack block size must be a multiple of --instant-chunk-size"
+            )
+    effective_packing_strategy = DEFAULT_PACKING_STRATEGY
+    if data_mode == "sft" and effective_sft_pack_block_size:
+        effective_packing_strategy = (
+            f"{DEFAULT_PACKING_STRATEGY}+block_aligned_{effective_sft_pack_block_size}"
+        )
     requested_micro_batch_size = micro_batch_size
     requested_grad_accum = grad_accum
     requested_eval_micro_batch_size = eval_micro_batch_size
@@ -592,6 +737,7 @@ def run_track1(
         else:
             lr = 2.0e-5
     weight_decay = weight_decay if weight_decay >= 0.0 else (0.01 if tuning_mode == "lora" else 0.1)
+    memory_probe_steps = max(0, int(memory_probe_steps))
     checkpointing_enabled = gradient_checkpointing == "true" or (
         gradient_checkpointing == "auto"
         and (tuning_mode == "full" or (tuning_mode == "lora" and micro_batch_size > 1))
@@ -638,7 +784,8 @@ def run_track1(
             "data_mode": data_mode,
             "loss_mask": "assistant_only" if data_mode == "sft" else "all_tokens",
             "sequence_packing": DEFAULT_SEQUENCE_PACKING,
-            "packing_strategy": DEFAULT_PACKING_STRATEGY,
+            "packing_strategy": effective_packing_strategy,
+            "sft_pack_block_size": effective_sft_pack_block_size,
             "seq_len": seq_len,
             "eval_blocks": eval_blocks,
             "seed": seed,
@@ -765,9 +912,11 @@ def run_track1(
         "data_mode": data_mode,
         "loss_mask": "assistant_only" if data_mode == "sft" else "all_tokens",
         "sequence_packing": DEFAULT_SEQUENCE_PACKING,
-        "packing_strategy": DEFAULT_PACKING_STRATEGY,
+        "packing_strategy": effective_packing_strategy,
+        "sft_pack_block_size": effective_sft_pack_block_size if data_mode == "sft" else None,
+        "requested_sft_pack_block_size": requested_sft_pack_block_size if data_mode == "sft" else None,
         "packed_block_size": seq_len,
-        "padding_tokens_per_block": 0,
+        "padding_tokens_per_block": None if effective_sft_pack_block_size else 0,
         "tuning_mode": tuning_mode,
         "adapter_mode": adapter_mode if tuning_mode == "lora" else None,
         "optimizer_name": resolved_optimizer_name,
@@ -775,6 +924,36 @@ def run_track1(
         "gradient_checkpointing": gradient_checkpointing,
         "gradient_checkpointing_enabled": checkpointing_enabled,
         "gradient_checkpointing_fallback_used": gradient_checkpointing_fallback_used,
+        "activation_compression_mode": activation_compression_mode,
+        "instant_projector_kind": instant_projector_kind
+        if activation_compression_mode == "instant-linear"
+        else None,
+        "instant_chunk_size": instant_chunk_size if activation_compression_mode == "instant-linear" else None,
+        "instant_keep": instant_keep if activation_compression_mode == "instant-linear" else None,
+        "instant_min_hidden_dim": instant_min_hidden_dim
+        if activation_compression_mode == "instant-linear"
+        else None,
+        "instant_hadamard_backend": instant_hadamard_backend
+        if activation_compression_mode == "instant-linear"
+        else None,
+        "instant_parameter_gradient": instant_parameter_gradient
+        if activation_compression_mode == "instant-linear"
+        else None,
+        "instant_parameter_grad_storage": (
+            "bf16_projected_coefficients"
+            if instant_parameter_gradient == "projected_lowpass"
+            else "full_activations"
+        )
+        if activation_compression_mode == "instant-linear"
+        else None,
+        "instant_target_modules": instant_target_modules
+        if activation_compression_mode == "instant-linear"
+        else None,
+        "instant_exact_input_grad": True if activation_compression_mode == "instant-linear" else None,
+        "instant_lowpass_wrapped_module_count": 0,
+        "instant_lowpass_wrapped_module_names": [],
+        "instant_lowpass_patched_gralora_module_count": 0,
+        "instant_lowpass_patched_gralora_module_names": [],
         "lora_r": lora_r if tuning_mode == "lora" else None,
         "lora_alpha": lora_alpha if tuning_mode == "lora" else None,
         "lora_dropout": lora_dropout if tuning_mode == "lora" else None,
@@ -811,6 +990,7 @@ def run_track1(
         "compile_model": compile_model,
         "compile_mode": compile_mode,
         "compile_warmup": compile_warmup,
+        "memory_probe_steps": memory_probe_steps,
         "save_final": save_final,
         "wandb_enabled": wandb_enabled,
         "wandb_project": wandb_project,
@@ -909,6 +1089,8 @@ def run_track1(
         raise ValueError(f"{model_id} tokenizer has no EOS token")
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    sft_pad_token_id = int(tokenizer.pad_token_id)
+    config["sft_pad_token_id"] = sft_pad_token_id if data_mode == "sft" else None
 
     def tokenize_piece(text: str) -> list[int]:
         return tokenizer(text, add_special_tokens=False).input_ids
@@ -922,21 +1104,36 @@ def run_track1(
     def render_sft_row(row: dict[str, Any]) -> tuple[list[int], list[int]] | None:
         return _render_sft_row(row, tokenize_piece, seq_len)
 
-    def build_eval_cache() -> tuple[torch.Tensor, torch.Tensor, int, Path, int]:
+    def align_sft_row(
+        row_ids: list[int],
+        row_labels: list[int],
+    ) -> tuple[list[int], list[int], list[int], int]:
+        return _pad_sft_row_to_block_multiple(
+            row_ids,
+            row_labels,
+            block_size=effective_sft_pack_block_size,
+            pad_token_id=sft_pad_token_id,
+            seq_len=seq_len,
+        )
+
+    def build_eval_cache() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, Path, int]:
         if data_mode == "sft":
             return build_sft_eval_cache()
         return build_cpt_eval_cache()
 
-    def load_eval_payload(eval_path: Path) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    def load_eval_payload(eval_path: Path) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
         payload = torch.load(eval_path, map_location="cpu")
         input_ids = payload["input_ids"]
+        attention_mask = payload.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         labels = payload.get("labels")
         if labels is None:
             labels = input_ids.clone()
         supervised_tokens = int(payload.get("supervised_tokens", _supervised_token_count(labels)))
-        return input_ids, labels, int(payload["skip_docs"]), supervised_tokens
+        return input_ids, attention_mask, labels, int(payload["skip_docs"]), supervised_tokens
 
-    def build_cpt_eval_cache() -> tuple[torch.Tensor, torch.Tensor, int, Path, int]:
+    def build_cpt_eval_cache() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, Path, int]:
         key_payload = {
             "model": model_id,
             "model_revision": model_revision,
@@ -946,15 +1143,15 @@ def run_track1(
             "seq_len": seq_len,
             "eval_blocks": eval_blocks,
             "sequence_packing": DEFAULT_SEQUENCE_PACKING,
-            "packing_strategy": DEFAULT_PACKING_STRATEGY,
+            "packing_strategy": effective_packing_strategy,
             "seed": seed,
             "kind": "all_token_cpt_packed_v2",
         }
         key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()[:20]
         eval_path = eval_dir / f"{key}.pt"
         if eval_path.exists():
-            input_ids, labels, skip_docs, supervised_tokens = load_eval_payload(eval_path)
-            return input_ids, labels, skip_docs, eval_path, supervised_tokens
+            input_ids, attention_mask, labels, skip_docs, supervised_tokens = load_eval_payload(eval_path)
+            return input_ids, attention_mask, labels, skip_docs, eval_path, supervised_tokens
 
         need_tokens = eval_blocks * seq_len
         token_buffer: list[int] = []
@@ -975,11 +1172,13 @@ def run_track1(
             )
 
         input_ids = torch.tensor(token_buffer[:need_tokens], dtype=torch.long).view(eval_blocks, seq_len)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         labels = input_ids.clone()
         supervised_tokens = int(labels.numel())
         torch.save(
             {
                 "input_ids": input_ids,
+                "attention_mask": attention_mask,
                 "labels": labels,
                 "skip_docs": skip_docs,
                 "supervised_tokens": supervised_tokens,
@@ -987,9 +1186,9 @@ def run_track1(
             },
             eval_path,
         )
-        return input_ids, labels, skip_docs, eval_path, supervised_tokens
+        return input_ids, attention_mask, labels, skip_docs, eval_path, supervised_tokens
 
-    def build_sft_eval_cache() -> tuple[torch.Tensor, torch.Tensor, int, Path, int]:
+    def build_sft_eval_cache() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, Path, int]:
         key_payload = {
             "model": model_id,
             "model_revision": model_revision,
@@ -1000,30 +1199,46 @@ def run_track1(
             "eval_blocks": eval_blocks,
             "eval_split": DEFAULT_SFT_EVAL_SPLIT if dataset_id == DEFAULT_SFT_DATASET_ID else "train",
             "sequence_packing": DEFAULT_SEQUENCE_PACKING,
-            "packing_strategy": DEFAULT_PACKING_STRATEGY,
-            "kind": "chatml_assistant_only_sft_packed_v2",
+            "packing_strategy": effective_packing_strategy,
+            "sft_pack_block_size": effective_sft_pack_block_size,
+            "sft_pad_token_id": sft_pad_token_id,
+            "kind": "chatml_assistant_only_sft_packed_v3",
         }
         key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()[:20]
         eval_path = eval_dir / f"{key}.pt"
         if eval_path.exists():
-            input_ids, labels, skip_docs, supervised_tokens = load_eval_payload(eval_path)
-            return input_ids, labels, skip_docs, eval_path, supervised_tokens
+            input_ids, attention_mask, labels, skip_docs, supervised_tokens = load_eval_payload(eval_path)
+            return input_ids, attention_mask, labels, skip_docs, eval_path, supervised_tokens
 
         token_buffer: list[int] = []
         label_buffer: list[int] = []
+        mask_buffer: list[int] = []
+        segment_buffer: list[int] = []
         input_blocks: list[torch.Tensor] = []
+        mask_blocks: list[torch.Tensor] = []
         label_blocks: list[torch.Tensor] = []
         skip_docs = 0
+        next_segment_id = 0
 
         def drain_blocks() -> None:
             while len(token_buffer) >= seq_len and len(input_blocks) < eval_blocks:
                 block_ids = token_buffer[:seq_len]
                 block_labels = label_buffer[:seq_len]
+                block_mask = mask_buffer[:seq_len]
+                block_segments = segment_buffer[:seq_len]
                 del token_buffer[:seq_len]
                 del label_buffer[:seq_len]
+                del mask_buffer[:seq_len]
+                del segment_buffer[:seq_len]
+                if activation_compression_mode == "instant-linear":
+                    _assert_no_cross_sequence_lowpass_segments(
+                        block_segments,
+                        effective_sft_pack_block_size,
+                    )
                 if _supervised_token_count(block_labels) == 0:
                     continue
                 input_blocks.append(torch.tensor(block_ids, dtype=torch.long))
+                mask_blocks.append(torch.tensor(block_mask, dtype=torch.long))
                 label_blocks.append(torch.tensor(block_labels, dtype=torch.long))
 
         for row in dataset_stream(shuffle=False, purpose="eval"):
@@ -1032,8 +1247,12 @@ def run_track1(
             if rendered is None:
                 continue
             row_ids, row_labels = rendered
+            row_ids, row_labels, row_mask, _pad_count = align_sft_row(row_ids, row_labels)
             token_buffer.extend(row_ids)
             label_buffer.extend(row_labels)
+            mask_buffer.extend(row_mask)
+            segment_buffer.extend([next_segment_id if mask else -1 for mask in row_mask])
+            next_segment_id += 1
             drain_blocks()
             if len(input_blocks) >= eval_blocks:
                 break
@@ -1044,11 +1263,13 @@ def run_track1(
             )
 
         input_ids = torch.stack(input_blocks)
+        attention_mask = torch.stack(mask_blocks)
         labels = torch.stack(label_blocks)
         supervised_tokens = _supervised_token_count(labels)
         torch.save(
             {
                 "input_ids": input_ids,
+                "attention_mask": attention_mask,
                 "labels": labels,
                 "skip_docs": 0 if dataset_id == DEFAULT_SFT_DATASET_ID else skip_docs,
                 "eval_docs": skip_docs,
@@ -1058,9 +1279,9 @@ def run_track1(
             eval_path,
         )
         train_skip = 0 if dataset_id == DEFAULT_SFT_DATASET_ID else skip_docs
-        return input_ids, labels, train_skip, eval_path, supervised_tokens
+        return input_ids, attention_mask, labels, train_skip, eval_path, supervised_tokens
 
-    eval_input_ids, eval_labels, train_skip_docs, eval_path, eval_supervised_tokens = build_eval_cache()
+    eval_input_ids, eval_attention_mask, eval_labels, train_skip_docs, eval_path, eval_supervised_tokens = build_eval_cache()
     config["eval_supervised_tokens"] = eval_supervised_tokens
     write_config()
     print(
@@ -1147,13 +1368,17 @@ def run_track1(
         ds = dataset_stream(shuffle=False).skip(train_skip_docs).shuffle(seed=seed, buffer_size=10_000)
         token_buffer: list[int] = []
         label_buffer: list[int] = []
-        batch: list[tuple[torch.Tensor, torch.Tensor]] = []
+        mask_buffer: list[int] = []
+        segment_buffer: list[int] = []
+        batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        next_segment_id = 0
 
         def make_batch() -> dict[str, torch.Tensor]:
             input_batch = torch.stack([item[0] for item in batch])
-            label_batch = torch.stack([item[1] for item in batch])
+            mask_batch = torch.stack([item[1] for item in batch])
+            label_batch = torch.stack([item[2] for item in batch])
             batch.clear()
-            return {"input_ids": input_batch, "labels": label_batch}
+            return {"input_ids": input_batch, "attention_mask": mask_batch, "labels": label_batch}
 
         while True:
             for row in ds:
@@ -1162,8 +1387,12 @@ def run_track1(
                     if rendered is None:
                         continue
                     row_ids, row_labels = rendered
+                    row_ids, row_labels, row_mask, _pad_count = align_sft_row(row_ids, row_labels)
                     token_buffer.extend(row_ids)
                     label_buffer.extend(row_labels)
+                    mask_buffer.extend(row_mask)
+                    segment_buffer.extend([next_segment_id if mask else -1 for mask in row_mask])
+                    next_segment_id += 1
                 else:
                     text = row.get("text")
                     if not isinstance(text, str) or not text.strip():
@@ -1171,17 +1400,29 @@ def run_track1(
                     row_ids = tokenize_text(text)
                     token_buffer.extend(row_ids)
                     label_buffer.extend(row_ids)
+                    mask_buffer.extend([1] * len(row_ids))
 
                 while len(token_buffer) >= seq_len:
                     block_ids = token_buffer[:seq_len]
                     block_labels = label_buffer[:seq_len]
+                    block_mask = mask_buffer[:seq_len]
+                    block_segments = segment_buffer[:seq_len] if data_mode == "sft" else []
                     del token_buffer[:seq_len]
                     del label_buffer[:seq_len]
+                    del mask_buffer[:seq_len]
+                    if data_mode == "sft":
+                        del segment_buffer[:seq_len]
+                    if data_mode == "sft" and activation_compression_mode == "instant-linear":
+                        _assert_no_cross_sequence_lowpass_segments(
+                            block_segments,
+                            effective_sft_pack_block_size,
+                        )
                     if data_mode == "sft" and _supervised_token_count(block_labels) == 0:
                         continue
                     batch.append(
                         (
                             torch.tensor(block_ids, dtype=torch.long),
+                            torch.tensor(block_mask, dtype=torch.long),
                             torch.tensor(block_labels, dtype=torch.long),
                         )
                     )
@@ -1311,11 +1552,12 @@ def run_track1(
                     for _ in range(lora_ga_batches):
                         batch = next(loraga_batch_iter)
                         input_ids = batch["input_ids"].to(device, non_blocking=True)
+                        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
                         labels = batch["labels"].to(device, non_blocking=True)
                         with torch.autocast("cuda", dtype=torch.bfloat16):
                             output = model(
                                 input_ids=input_ids,
-                                attention_mask=torch.ones_like(input_ids, dtype=torch.long),
+                                attention_mask=attention_mask,
                                 labels=labels,
                                 use_cache=False,
                             )
@@ -1346,9 +1588,13 @@ def run_track1(
         def iter_eva_batches():
             for start in range(0, eva_blocks, eval_micro_batch_size):
                 batch = eval_input_ids[start : start + eval_micro_batch_size].to(device, non_blocking=True)
+                attention_mask = eval_attention_mask[start : start + eval_micro_batch_size].to(
+                    device,
+                    non_blocking=True,
+                )
                 yield {
                     "input_ids": batch,
-                    "attention_mask": torch.ones_like(batch, dtype=torch.long),
+                    "attention_mask": attention_mask,
                 }
 
         print(
@@ -1370,6 +1616,99 @@ def run_track1(
         for name, parameter in model.named_parameters():
             if "lora_A" in name:
                 parameter.requires_grad_(False)
+
+    instant_lowpass_wrapped_modules: list[str] = []
+    refresh_instant_lowpass_merged_weights: Callable[..., int] | None = None
+    if activation_compression_mode == "instant-linear":
+        import sys
+
+        if "/root" not in sys.path:
+            sys.path.append("/root")
+        from instant_lowpass import (
+            InstantLowpassConfig,
+            patch_gralora_with_instant_lowpass,
+            refresh_gralora_merged_weights,
+            replace_linear_with_instant_lowpass,
+        )
+
+        instant_config = InstantLowpassConfig(
+            projector_kind=instant_projector_kind,
+            chunk_size=instant_chunk_size,
+            keep=instant_keep,
+            min_hidden_dim=instant_min_hidden_dim,
+            hadamard_backend=instant_hadamard_backend,
+            parameter_gradient=instant_parameter_gradient,
+            exact_input_grad=True,
+            enabled=True,
+        )
+
+        def instant_module_filter(name: str, linear: torch.nn.Linear) -> bool:
+            if any(part in name for part in ("visual", "lm_head", "embed")):
+                return False
+            trainable = linear.weight.requires_grad or (
+                linear.bias is not None and linear.bias.requires_grad
+            )
+            if instant_target_modules != "all" and not trainable:
+                return False
+            if instant_target_modules == "adapter" and not (
+                "lora_" in name or "gralora_" in name
+            ):
+                return False
+            if min(int(linear.in_features), int(linear.out_features)) < instant_min_hidden_dim:
+                return False
+            return True
+
+        instant_lowpass_wrapped_modules = replace_linear_with_instant_lowpass(
+            model,
+            instant_config,
+            module_filter=instant_module_filter,
+        )
+        instant_lowpass_patched_gralora_modules = (
+            patch_gralora_with_instant_lowpass(model, instant_config)
+            if adapter_mode == "gralora"
+            else []
+        )
+        if (
+            instant_lowpass_patched_gralora_modules
+            and instant_parameter_gradient == "exact"
+        ):
+
+            def refresh_instant_lowpass_merged_weights(*, force: bool = False) -> int:
+                return refresh_gralora_merged_weights(uncompiled_model, force=force)
+
+            merged_weight_count = refresh_instant_lowpass_merged_weights()
+        else:
+            merged_weight_count = 0
+        if not instant_lowpass_wrapped_modules and not instant_lowpass_patched_gralora_modules:
+            raise RuntimeError("instant-linear activation compression found no Linear modules to wrap")
+        config["instant_lowpass_wrapped_module_count"] = len(instant_lowpass_wrapped_modules)
+        config["instant_lowpass_wrapped_module_names"] = instant_lowpass_wrapped_modules[:100]
+        config["instant_lowpass_patched_gralora_module_count"] = len(
+            instant_lowpass_patched_gralora_modules
+        )
+        config["instant_lowpass_patched_gralora_module_names"] = (
+            instant_lowpass_patched_gralora_modules[:100]
+        )
+        config["instant_lowpass_merged_weight_count"] = merged_weight_count
+        config["instant_lowpass_merged_weight_refresh"] = (
+            "force_after_optimizer_step_inplace" if refresh_instant_lowpass_merged_weights else None
+        )
+        write_config()
+        print(
+            "enabled instant-linear activation compression "
+            f"projector={instant_projector_kind} keep={instant_keep}/{instant_chunk_size} "
+            f"min_hidden_dim={instant_min_hidden_dim} "
+            f"hadamard_backend={instant_hadamard_backend} "
+            f"checkpointing={'on' if checkpointing_enabled else 'off'} "
+            f"param_grad={instant_parameter_gradient} "
+            f"param_grad_storage={config['instant_parameter_grad_storage']} "
+            f"gralora_forward={'merged' if refresh_instant_lowpass_merged_weights else 'unmerged_adapter'} "
+            f"target={instant_target_modules} "
+            f"wrapped={len(instant_lowpass_wrapped_modules)} "
+            f"patched_gralora={len(instant_lowpass_patched_gralora_modules)} "
+            f"merged_weights={merged_weight_count}",
+            flush=True,
+        )
 
     named_trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     trainable_params = [p for _, p in named_trainable_params]
@@ -1826,12 +2165,25 @@ def run_track1(
             return
         optimizer.zero_grad(set_to_none=True)
 
+    instant_lowpass_refresh_calls = 0
+    instant_lowpass_refresh_weight_updates = 0
+    instant_lowpass_refresh_launch_seconds = 0.0
+
     def optimizer_step() -> None:
+        nonlocal instant_lowpass_refresh_calls
+        nonlocal instant_lowpass_refresh_launch_seconds
+        nonlocal instant_lowpass_refresh_weight_updates
         if isinstance(optimizer, list):
             for opt in optimizer:
                 opt.step()
-            return
-        optimizer.step()
+        else:
+            optimizer.step()
+        if refresh_instant_lowpass_merged_weights is not None:
+            refresh_start = time.monotonic()
+            refreshed = refresh_instant_lowpass_merged_weights(force=True)
+            instant_lowpass_refresh_launch_seconds += time.monotonic() - refresh_start
+            instant_lowpass_refresh_calls += 1
+            instant_lowpass_refresh_weight_updates += refreshed
 
     @torch.no_grad()
     def evaluate(label: str) -> float:
@@ -1840,11 +2192,14 @@ def run_track1(
         total_supervised = 0
         for start in range(0, eval_blocks, eval_micro_batch_size):
             batch = eval_input_ids[start : start + eval_micro_batch_size].to(device, non_blocking=True)
+            attention_mask = eval_attention_mask[start : start + eval_micro_batch_size].to(
+                device,
+                non_blocking=True,
+            )
             labels = eval_labels[start : start + eval_micro_batch_size].to(device, non_blocking=True)
             supervised = _supervised_token_count(labels.detach().cpu())
             if supervised == 0:
                 continue
-            attention_mask = torch.ones_like(batch, dtype=torch.long)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output = model(input_ids=batch, attention_mask=attention_mask, labels=labels, use_cache=False)
             weighted_loss_sum += float(output.loss.detach().cpu()) * supervised
@@ -1881,11 +2236,12 @@ def run_track1(
         for _ in range(grad_accum):
             warmup_batch = next(batch_iter)
             input_ids = warmup_batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = warmup_batch["attention_mask"].to(device, non_blocking=True)
             labels = warmup_batch["labels"].to(device, non_blocking=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 warmup_loss = model(
                     input_ids=input_ids,
-                    attention_mask=torch.ones_like(input_ids, dtype=torch.long),
+                    attention_mask=attention_mask,
                     labels=labels,
                     use_cache=False,
                 ).loss
@@ -1984,16 +2340,36 @@ def run_track1(
     tokens = 0
     supervised_tokens_seen = 0
     last_loss = math.nan
+    memory_probe_records: list[dict[str, Any]] = []
+
+    def log_memory_probe(step_value: int, phase: str) -> None:
+        torch.cuda.synchronize()
+        stats = collect_gpu_stats()
+        record = {
+            "event": "memory_probe",
+            "step": step_value,
+            "phase": phase,
+            **stats,
+        }
+        memory_probe_records.append(record)
+        log_metric(record)
+
     while time.monotonic() < train_deadline:
         optimizer_zero_grad()
+        next_step = step + 1
+        probe_this_step = memory_probe_steps > 0 and next_step <= memory_probe_steps
+        if probe_this_step:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(gpu_index)
+            log_memory_probe(next_step, "step_start")
         accum_losses: list[float] = []
         accum_supervised_tokens = 0
         accum_loss_tensors: list[tuple[torch.Tensor, int]] = []
         for _ in range(grad_accum):
             batch = next(batch_iter)
             input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
             accum_losses.append(float(output.loss.detach().cpu()))
@@ -2005,9 +2381,15 @@ def run_track1(
             supervised_tokens_seen += batch_supervised
             accum_loss_tensors.append((output.loss, batch_supervised))
 
+        if probe_this_step:
+            log_memory_probe(next_step, "after_forward")
+
         for loss_tensor, batch_supervised in accum_loss_tensors:
             loss = loss_tensor * (batch_supervised / accum_supervised_tokens)
             loss.backward()
+
+        if probe_this_step:
+            log_memory_probe(next_step, "after_backward")
 
         step += 1
         lr_now = time.monotonic()
@@ -2016,6 +2398,8 @@ def run_track1(
         set_optimizer_lr_multiplier(lr_multiplier)
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         optimizer_step()
+        if probe_this_step:
+            log_memory_probe(step, "after_optimizer_step")
         last_loss = float(np.mean(accum_losses))
 
         if log_every > 0 and (step == 1 or step % log_every == 0):
@@ -2052,9 +2436,28 @@ def run_track1(
     # Keep post-budget evaluation from triggering a new compiled eval graph.
     model = uncompiled_model
     final_loss = evaluate("final_eval")
+    instant_lowpass_runtime_stats: dict[str, int] = {}
+    if activation_compression_mode == "instant-linear":
+        import sys
+
+        if "/root" not in sys.path:
+            sys.path.append("/root")
+        from instant_lowpass import collect_instant_lowpass_stats
+
+        instant_lowpass_runtime_stats = collect_instant_lowpass_stats(uncompiled_model)
     summary = {
         **config,
+        **instant_lowpass_runtime_stats,
         **peak_gpu_stats,
+        "instant_lowpass_refresh_calls": instant_lowpass_refresh_calls
+        if activation_compression_mode == "instant-linear"
+        else None,
+        "instant_lowpass_refresh_weight_updates": instant_lowpass_refresh_weight_updates
+        if activation_compression_mode == "instant-linear"
+        else None,
+        "instant_lowpass_refresh_launch_seconds": instant_lowpass_refresh_launch_seconds
+        if activation_compression_mode == "instant-linear"
+        else None,
         "record_date": dt.date.today().isoformat(),
         "run_dir": str(run_dir),
         "eval_cache": str(eval_path),
@@ -2078,6 +2481,7 @@ def run_track1(
         "baseline_eval_loss": baseline_loss,
         "final_eval_loss": final_loss,
         "eval_loss_drop": baseline_loss - final_loss,
+        "memory_probe_records": memory_probe_records,
     }
 
     if save_final:
@@ -2099,8 +2503,16 @@ def run_track1(
     record_artifacts = None
     if record_description:
         src_path = Path(__file__).resolve()
+        instant_lowpass_path = src_path.parent / "instant_lowpass.py"
+        instant_lowpass_triton_path = src_path.parent / "instant_lowpass_triton.py"
         record_artifacts = {
             "main.py": src_path.read_text() if src_path.exists() else "",
+            "instant_lowpass.py": instant_lowpass_path.read_text()
+            if instant_lowpass_path.exists()
+            else "",
+            "instant_lowpass_triton.py": instant_lowpass_triton_path.read_text()
+            if instant_lowpass_triton_path.exists()
+            else "",
             "config.json": json.dumps(config, indent=2, default=_json_default) + "\n",
             "summary.json": json.dumps(summary, indent=2, default=_json_default) + "\n",
             "record.txt": _format_record_text(summary),
@@ -2131,10 +2543,19 @@ def main(
     dataset_config: str = "",
     dataset_revision: str = "",
     data_mode: str = "",
+    sft_pack_block_size: int = 0,
     tuning_mode: str = "lora",
     adapter_mode: str = "",
     optimizer_name: str = "auto",
     gradient_checkpointing: str = "auto",
+    activation_compression_mode: str = "off",
+    instant_projector_kind: str = "hadamard",
+    instant_chunk_size: int = 64,
+    instant_keep: int = 32,
+    instant_min_hidden_dim: int = 64,
+    instant_hadamard_backend: str = "auto",
+    instant_parameter_gradient: str = "projected_lowpass",
+    instant_target_modules: str = "trainable",
     lora_r: int = 32,
     lora_alpha: int = 64,
     lora_dropout: float = 0.0,
@@ -2164,6 +2585,7 @@ def main(
     compile_model: bool = True,
     compile_mode: str = "max-autotune-no-cudagraphs",
     compile_warmup: bool = True,
+    memory_probe_steps: int = 0,
     save_final: bool = False,
     log_every: int = 5,
     wandb_project: str = "",
@@ -2211,10 +2633,19 @@ def main(
         dataset_config=dataset_config,
         dataset_revision=dataset_revision,
         data_mode=data_mode,  # type: ignore[arg-type]
+        sft_pack_block_size=sft_pack_block_size,
         tuning_mode=tuning_mode,  # type: ignore[arg-type]
         adapter_mode=adapter_mode,  # type: ignore[arg-type]
         optimizer_name=optimizer_name,
         gradient_checkpointing=gradient_checkpointing,  # type: ignore[arg-type]
+        activation_compression_mode=activation_compression_mode,  # type: ignore[arg-type]
+        instant_projector_kind=instant_projector_kind,  # type: ignore[arg-type]
+        instant_chunk_size=instant_chunk_size,
+        instant_keep=instant_keep,
+        instant_min_hidden_dim=instant_min_hidden_dim,
+        instant_hadamard_backend=instant_hadamard_backend,  # type: ignore[arg-type]
+        instant_parameter_gradient=instant_parameter_gradient,
+        instant_target_modules=instant_target_modules,  # type: ignore[arg-type]
         lora_r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
@@ -2244,6 +2675,7 @@ def main(
         compile_model=compile_model,
         compile_mode=compile_mode,
         compile_warmup=compile_warmup,
+        memory_probe_steps=memory_probe_steps,
         save_final=save_final,
         log_every=log_every,
         wandb_project=wandb_project,
