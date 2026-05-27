@@ -126,7 +126,10 @@ A PR may not be accepted if it:
 | Legacy CPT dataset | `HuggingFaceTB/finemath` | `e92b25a616738fe95dc186b64dfb19f9c8525594` |
 | Legacy CPT config | `finemath-4plus` | — |
 
-All are public and ungated.
+All are public and ungated. The Sumerian and ConlangCrafter CPT corpora
+(see [Foreign-distribution CPT datasets](#foreign-distribution-cpt-datasets))
+are *optional alternatives* selected via `--dataset-id`; record runs against
+fixed inputs still target FineMath.
 
 ## Quick start
 
@@ -246,6 +249,69 @@ Open a PR with the new record folder. The PR should:
 3. List all contributors.
 4. Update the record history table in this README.
 
+## Foreign-distribution CPT datasets
+
+The Track 1 SFT default (`HuggingFaceH4/ultrachat_200k`) is general English
+chat, which is close to `Qwen3.5-4B-Base`'s pretraining distribution and
+therefore gives only a small `baseline_eval_loss − final_eval_loss` signal. To
+amplify the signal, the trainer can run continued-pretraining (`--data-mode
+cpt`) against datasets that sit further from pretraining:
+
+| Candidate | What | HF id | Why it's foreign |
+|---|---|---|---|
+| **ConlangCrafter** | A synthetic constructed language generated post-pretraining-cutoff. ~11M tokens (3,077 chunks) of native prose written by Vertex Gemini 3.5 Flash using a [ConlangCrafter](https://arxiv.org/abs/2508.06094) spec as the system prompt. | [`TearedModels/conlangcrafter-cpt-bd412d52`](https://huggingface.co/datasets/TearedModels/conlangcrafter-cpt-bd412d52) — publish your own with `scripts/synthesize_conlang_cpt.py` + `scripts/push_conlang_dataset.py` | Guaranteed novel: the language did not exist before the synthesis run. |
+| **SumTablets** | ~91k Sumerian cuneiform tablet transliterations from [Oracc](https://arxiv.org/abs/2602.22200). | [`colesimmons/SumTablets`](https://huggingface.co/datasets/colesimmons/SumTablets) | Real but ancient and deciphered. Under-represented in Qwen pretraining. |
+| **FineMath** (baseline) | Existing legacy CPT default. | `HuggingFaceTB/finemath` | Anchor for comparison. |
+
+A third option that was considered and rejected: **Linear A** and other
+undeciphered scripts. Linear A has ~7,400 signs total across 1,427 inscriptions
+and is undeciphered; the corpus is 3+ orders of magnitude too small, and the
+lack of decipherment means there is no grammar regularity for the model to
+learn — any loss drop would be memorization, not language learning.
+
+### Generating the conlang corpus
+
+Vertex AI Gemini synthesizes ~10M tokens against one of the 64 conlang specs
+in [`malper/ConlangCrafter`](https://huggingface.co/datasets/malper/ConlangCrafter).
+A per-chunk quality gate (lexicon-overlap minimum, English-word maximum,
+minimum length) rejects drifted chunks; failed chunks are retried up to twice
+with new topic seeds.
+
+```bash
+# One-shot generation. The default picks the longest DeepSeek-R1 spec from
+# malper/ConlangCrafter and targets ~10M output tokens.
+uv run python scripts/synthesize_conlang_cpt.py \
+  --target-tokens 10_000_000 --concurrency 32
+
+# Smoke first (≈50k tokens, ~1-2 min) to verify quality before committing.
+uv run python scripts/synthesize_conlang_cpt.py --smoke
+
+# Push the resulting parquet + spec to your HF account as a dataset.
+uv run python scripts/push_conlang_dataset.py data/conlang_cpt/<language_id>
+```
+
+Cost on Gemini 3.5 Flash is roughly $5-20 for 10M output tokens.
+
+### Running CPT against a foreign dataset
+
+After publishing your conlang corpus to HF (or to load any HF dataset with a
+`{text: str}` schema), set the environment variable and use the shortcuts:
+
+```bash
+export CONLANG_DATASET_ID=<your-hf-user>/conlangcrafter-cpt-<language_id>
+
+./run.sh conlang-smoke      # 6s sanity check
+./run.sh conlang-track2     # 5-min sprint
+./run.sh conlang-track1     # 30-min Track 1 run
+
+./run.sh sumerian-track2    # uses colesimmons/SumTablets, --cpt-text-field transliteration
+./run.sh sumerian-track1
+```
+
+The `--cpt-text-field` flag (default `text`) picks the row column the CPT
+loader reads. The Sumerian shortcuts hard-code `transliteration` because that
+is SumTablets' content field.
+
 ## Track 1 SFT Validation
 
 Track 1 now defaults to packed UltraChat general chat SFT plus GraLoRA. The
@@ -298,9 +364,15 @@ moved compile and warmup inside the timed budget.
 
 ### Track 2 — 5 minutes
 
+Foreign-distribution CPT sweep (2026-05-27): both ConlangCrafter and Sumerian
+deliver dramatically larger eval-loss drops than the FineMath baseline, and
+both clear the +0 record threshold.
+
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|-----------|-------------|------|-----|--------------|
-| 1 | — | Baseline run | — | — | — |
+| sumerian-v1 | **+1.092** | CPT LoRA on `colesimmons/SumTablets` (`transliteration` field), 99 steps, 3.24M tokens, baseline 1.946 → final 0.855 | 2026-05-27 | [Modal run](https://modal.com/apps/tear-labs-43657/main/ap-85UYkCwqyOPwwFBJwmV4Tz) | — |
+| conlang-v1 | **+0.510** | CPT LoRA on `TearedModels/conlangcrafter-cpt-bd412d52` (ConlangCrafter synthetic conlang), 101 steps, 3.31M tokens, baseline 0.854 → final 0.345 | 2026-05-27 | [Modal run](https://modal.com/apps/tear-labs-43657/main/ap-ZQyBFDPmLUkkHl9O6JmUGB) | — |
+| finemath-baseline | -0.034 | CPT LoRA on `HuggingFaceTB/finemath` (legacy default), 101 steps, 3.31M tokens, baseline 1.431 → final 1.466 | 2026-05-27 | [Modal run](https://modal.com/apps/tear-labs-43657/main/ap-WHtCz9Ep4KqNEDIMp6e2lz) | — |
 
 ### Track 3 — 2 hours
 
@@ -538,7 +610,11 @@ Modal image with:
   adapters before compile and auto-resolves to `micro_batch_size=8`,
   `grad_accum=1`, and checkpointing on H100
 - Track 1 defaults to UltraChat general chat SFT, rendered as Qwen ChatML
-  with assistant-only labels; `--data-mode cpt` restores packed FineMath all-token labels
+  with assistant-only labels; `--data-mode cpt` restores packed FineMath all-token labels.
+  CPT mode accepts any HF dataset with a string text column via
+  `--dataset-id` and `--cpt-text-field` (default `text`) — see
+  [Foreign-distribution CPT datasets](#foreign-distribution-cpt-datasets) for
+  the synthetic-conlang and Sumerian alternatives
 - Adapter selection via `--adapter-mode gralora`, `lora`, or `lora_ga`; LoRA-GA
   reuses masked SFT batches for its gradient estimate, and GraLoRA defaults to
   `--gralora-k 2`

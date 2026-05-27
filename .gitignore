@@ -8,6 +8,8 @@ logs/
 runs/
 cache/
 .cache/
+# Locally generated foreign-CPT corpora (push to HF then load from there).
+data/
 
 *.log
 *.tmp

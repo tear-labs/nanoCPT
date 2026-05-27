@@ -49,6 +49,7 @@ DEFAULT_NORMUON_BETA2 = 0.95
 DEFAULT_NORMUON_EPS = 1.0e-8
 DEFAULT_SEQUENCE_PACKING = True
 DEFAULT_PACKING_STRATEGY = "stream_concat_no_padding"
+DEFAULT_CPT_TEXT_FIELD = "text"
 
 DATA_MODE_CHOICES = {"sft", "cpt"}
 ADAPTER_MODE_CHOICES = {"lora", "lora_ga", "gralora"}
@@ -318,6 +319,7 @@ def run_track1(
     dataset_id: str = "",
     dataset_config: str = "",
     dataset_revision: str = "",
+    cpt_text_field: str = DEFAULT_CPT_TEXT_FIELD,
     data_mode: str = "sft",
     tuning_mode: Literal["lora", "full"] = "lora",
     adapter_mode: str = "",
@@ -949,6 +951,7 @@ def run_track1(
             "packing_strategy": DEFAULT_PACKING_STRATEGY,
             "seed": seed,
             "kind": "all_token_cpt_packed_v2",
+            "text_field": cpt_text_field,
         }
         key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()[:20]
         eval_path = eval_dir / f"{key}.pt"
@@ -960,7 +963,7 @@ def run_track1(
         token_buffer: list[int] = []
         skip_docs = 0
         for row in dataset_stream(shuffle=False):
-            text = row.get("text")
+            text = row.get(cpt_text_field)
             if not isinstance(text, str) or not text.strip():
                 skip_docs += 1
                 continue
@@ -1165,7 +1168,7 @@ def run_track1(
                     token_buffer.extend(row_ids)
                     label_buffer.extend(row_labels)
                 else:
-                    text = row.get("text")
+                    text = row.get(cpt_text_field)
                     if not isinstance(text, str) or not text.strip():
                         continue
                     row_ids = tokenize_text(text)
@@ -2130,6 +2133,7 @@ def main(
     dataset_id: str = "",
     dataset_config: str = "",
     dataset_revision: str = "",
+    cpt_text_field: str = DEFAULT_CPT_TEXT_FIELD,
     data_mode: str = "",
     tuning_mode: str = "lora",
     adapter_mode: str = "",
@@ -2210,6 +2214,7 @@ def main(
         dataset_id=dataset_id,
         dataset_config=dataset_config,
         dataset_revision=dataset_revision,
+        cpt_text_field=cpt_text_field,
         data_mode=data_mode,  # type: ignore[arg-type]
         tuning_mode=tuning_mode,  # type: ignore[arg-type]
         adapter_mode=adapter_mode,  # type: ignore[arg-type]
