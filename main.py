@@ -42,13 +42,8 @@ DEFAULT_SFT_DATASET_REVISION = "8049631c405ae6576f93f445c6b8166f76f5505a"
 DEFAULT_SFT_TRAIN_SPLIT = "train_sft"
 DEFAULT_SFT_EVAL_SPLIT = "test_sft"
 DEFAULT_EFFECTIVE_TOKENS_PER_STEP = 32_768
-DEFAULT_LORA_MICRO_BATCH_SIZE = 8
 DEFAULT_FULL_MICRO_BATCH_SIZE = 1
 DEFAULT_EVAL_MICRO_BATCH_SIZE = 2
-DEFAULT_GRALORA_K = 2
-DEFAULT_ADAPTER_MODE = "gralora"
-DEFAULT_LORAPLUS_LR_RATIO = 16.0
-DEFAULT_LORA_EVA_RHO = 2.0
 DEFAULT_MUON_QUANT_BLOCK_SIZE = 2048
 DEFAULT_NORMUON_BETA2 = 0.95
 DEFAULT_NORMUON_EPS = 1.0e-8
@@ -57,7 +52,6 @@ DEFAULT_PACKING_STRATEGY = "stream_concat_no_padding"
 DEFAULT_CPT_TEXT_FIELD = "text"
 
 DATA_MODE_CHOICES = {"sft", "cpt"}
-ADAPTER_MODE_CHOICES = {"lora", "lora_ga", "gralora"}
 OPTIMIZER_CHOICES = {
     "auto",
     "adamw8bit",
@@ -65,15 +59,9 @@ OPTIMIZER_CHOICES = {
     "muon",
     "muon8",
     "normuon",
-    "loraplus_adamw",
-    "loraplus_adamw8bit",
-    "lorafa",
 }
 LR_SCHEDULE_CHOICES = {"constant", "linear", "cosine", "wsd"}
 MUON_LR_ADJUSTMENT_CHOICES = {"original", "match_rms_adamw"}
-LORA_INIT_CHOICES = {"default", "gaussian", "pissa", "olora", "eva", "orthogonal", "lora_ga"}
-LORA_GA_DIRECTION_CHOICES = {"ArBr", "A2rBr", "ArB2r", "random"}
-LORA_GA_SCALE_CHOICES = {"stable", "weight_svd", "gd_scale", "unit"}
 
 PEAK_GPU_STAT_KEYS = {
     "cuda_max_memory_allocated_gib": "peak_cuda_memory_allocated_gib",
@@ -235,7 +223,6 @@ image = (
         "huggingface_hub>=0.30.0",
         "numpy>=2.0.0",
         "nvidia-ml-py>=12.560.30",
-        "peft==0.19.1",
         "safetensors>=0.5.0",
         "tilelang",
         "tqdm>=4.66.0",
@@ -267,7 +254,6 @@ def _format_record_text(summary: dict[str, Any]) -> str:
         f"Loss mask: {summary.get('loss_mask', 'all_tokens')}\n"
         f"Sequence packing: {summary.get('sequence_packing', DEFAULT_SEQUENCE_PACKING)} "
         f"({summary.get('packing_strategy', DEFAULT_PACKING_STRATEGY)})\n"
-        f"Adapter mode: {summary.get('adapter_mode', DEFAULT_ADAPTER_MODE)}\n"
         f"Minutes: {summary['minutes']}\n"
         f"Eval loss drop: {summary['eval_loss_drop']:.6f}\n"
         f"Baseline eval loss: {summary['baseline_eval_loss']:.6f}\n"
@@ -328,9 +314,7 @@ def run_track1(
     dataset_config: str = "",
     dataset_revision: str = "",
     cpt_text_field: str = DEFAULT_CPT_TEXT_FIELD,
-    data_mode: str = "sft",
-    tuning_mode: Literal["lora", "full"] = "lora",
-    adapter_mode: str = "",
+    data_mode: str = "cpt",
     optimizer_name: Literal[
         "auto",
         "adamw8bit",
@@ -338,29 +322,8 @@ def run_track1(
         "muon",
         "muon8",
         "normuon",
-        "loraplus_adamw",
-        "loraplus_adamw8bit",
-        "lorafa",
     ] = "auto",
     gradient_checkpointing: Literal["auto", "true", "false"] = "auto",
-    lora_r: int = 32,
-    lora_alpha: int = 64,
-    lora_dropout: float = 0.0,
-    lora_target_modules: str = "all-linear",
-    gralora_k: int = DEFAULT_GRALORA_K,
-    lora_use_rslora: bool = True,
-    lora_use_dora: bool = False,
-    lora_init: str = "default",
-    lora_eva_rho: float = DEFAULT_LORA_EVA_RHO,
-    lora_eva_batches: int = 16,
-    lora_ga_batches: int = 4,
-    lora_ga_micro_batch_size: int = 1,
-    lora_ga_direction: str = "ArB2r",
-    lora_ga_scale: str = "stable",
-    lora_ga_stable_gamma: int = 16,
-    lora_ga_cache: bool = False,
-    loraplus_lr_ratio: float = DEFAULT_LORAPLUS_LR_RATIO,
-    loraplus_lr_embedding: float = 1.0e-6,
     muon_lr_adjustment: Literal["original", "match_rms_adamw"] = "match_rms_adamw",
     muon_quant_block_size: int = DEFAULT_MUON_QUANT_BLOCK_SIZE,
     normuon_beta2: float = DEFAULT_NORMUON_BETA2,
@@ -428,20 +391,9 @@ def run_track1(
         raise ValueError("--weight-decay must be >= 0; use -1 for the mode default")
     if track not in TRACKS:
         raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
-    data_mode = str(data_mode or ("sft" if track == "1" else "cpt")).lower().replace("-", "_")
+    data_mode = str(data_mode or "cpt").lower().replace("-", "_")
     if data_mode not in DATA_MODE_CHOICES:
         raise ValueError(f"--data-mode must be one of: {', '.join(sorted(DATA_MODE_CHOICES))}")
-    tuning_mode = str(tuning_mode).lower()
-    if tuning_mode not in {"lora", "full"}:
-        raise ValueError("--tuning-mode must be one of: lora, full")
-    adapter_mode_default = DEFAULT_ADAPTER_MODE if tuning_mode == "lora" and data_mode == "sft" else "lora"
-    adapter_mode = str(adapter_mode or adapter_mode_default).lower().replace("-", "_")
-    if adapter_mode in {"loraga", "lora-ga"}:
-        adapter_mode = "lora_ga"
-    if adapter_mode not in ADAPTER_MODE_CHOICES:
-        raise ValueError(
-            f"--adapter-mode must be one of: {', '.join(sorted(ADAPTER_MODE_CHOICES))}"
-        )
     gradient_checkpointing = str(gradient_checkpointing).lower()
     if gradient_checkpointing not in {"auto", "true", "false"}:
         raise ValueError("--gradient-checkpointing must be one of: auto, true, false")
@@ -450,64 +402,6 @@ def run_track1(
         raise ValueError(f"--optimizer-name must be one of: {', '.join(sorted(OPTIMIZER_CHOICES))}")
     if wandb_mode not in {"online", "offline", "disabled"}:
         raise ValueError("--wandb-mode must be one of: online, offline, disabled")
-    if lora_r < 1:
-        raise ValueError("--lora-r must be positive")
-    if lora_alpha < 1:
-        raise ValueError("--lora-alpha must be positive")
-    if lora_dropout < 0.0 or lora_dropout >= 1.0:
-        raise ValueError("--lora-dropout must be in [0, 1)")
-    if gralora_k < 1:
-        raise ValueError("--gralora-k must be positive")
-    if adapter_mode == "gralora" and lora_r % gralora_k != 0:
-        raise ValueError("--lora-r must be divisible by --gralora-k for GraLoRA")
-    lora_init = str(lora_init).lower().replace("-", "_")
-    if lora_init == "loraga":
-        lora_init = "lora_ga"
-    if adapter_mode == "lora_ga":
-        if lora_init not in {"default", "lora_ga"}:
-            raise ValueError("--adapter-mode lora_ga cannot be combined with a different --lora-init")
-        lora_init = "lora_ga"
-    elif adapter_mode == "lora" and lora_init == "lora_ga":
-        adapter_mode = "lora_ga"
-    if lora_init.startswith("pissa_niter_"):
-        try:
-            pissa_iters = int(lora_init.removeprefix("pissa_niter_"))
-        except ValueError as exc:
-            raise ValueError("--lora-init pissa_niter_N requires an integer N") from exc
-        if pissa_iters < 1:
-            raise ValueError("--lora-init pissa_niter_N requires N >= 1")
-    elif lora_init not in LORA_INIT_CHOICES:
-        raise ValueError(
-            "--lora-init must be one of: "
-            f"{', '.join(sorted(LORA_INIT_CHOICES))}, or pissa_niter_N"
-        )
-    if lora_eva_rho < 1.0:
-        raise ValueError("--lora-eva-rho must be >= 1.0")
-    if lora_eva_batches < 1:
-        raise ValueError("--lora-eva-batches must be positive")
-    if lora_ga_batches < 1:
-        raise ValueError("--lora-ga-batches must be positive")
-    if lora_ga_micro_batch_size < 1:
-        raise ValueError("--lora-ga-micro-batch-size must be positive")
-    direction_lookup = {value.lower(): value for value in LORA_GA_DIRECTION_CHOICES}
-    lora_ga_direction = direction_lookup.get(str(lora_ga_direction).lower(), lora_ga_direction)
-    if lora_ga_direction not in LORA_GA_DIRECTION_CHOICES:
-        raise ValueError(
-            "--lora-ga-direction must be one of: "
-            f"{', '.join(sorted(LORA_GA_DIRECTION_CHOICES))}"
-        )
-    lora_ga_scale = str(lora_ga_scale).lower()
-    if lora_ga_scale not in LORA_GA_SCALE_CHOICES:
-        raise ValueError(
-            "--lora-ga-scale must be one of: "
-            f"{', '.join(sorted(LORA_GA_SCALE_CHOICES))}"
-        )
-    if lora_ga_stable_gamma < 1:
-        raise ValueError("--lora-ga-stable-gamma must be positive")
-    if loraplus_lr_ratio < 1.0:
-        raise ValueError("--loraplus-lr-ratio must be >= 1.0")
-    if loraplus_lr_embedding <= 0.0:
-        raise ValueError("--loraplus-lr-embedding must be positive")
     if muon_lr_adjustment not in MUON_LR_ADJUSTMENT_CHOICES:
         raise ValueError(
             "--muon-lr-adjustment must be one of: "
@@ -534,29 +428,6 @@ def run_track1(
         raise RuntimeError("CUDA is required for the Modal H100 training path")
     if data_mode == "sft" and track != "1":
         raise ValueError("--data-mode sft is currently implemented only for Track 1")
-    if optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit", "lorafa"} and tuning_mode != "lora":
-        raise ValueError(f"--optimizer-name {optimizer_name} requires --tuning-mode lora")
-    if (
-        adapter_mode == "gralora"
-        and optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit", "lorafa"}
-    ):
-        raise ValueError(f"--optimizer-name {optimizer_name} requires standard LoRA adapters")
-    if (
-        tuning_mode == "lora"
-        and adapter_mode == "gralora"
-        and optimizer_name in {"muon", "muon8", "normuon"}
-    ):
-        raise ValueError(f"--optimizer-name {optimizer_name} requires standard LoRA or full tuning")
-    if adapter_mode == "gralora" and lora_init != "default":
-        raise ValueError("--adapter-mode gralora does not support --lora-init")
-    if adapter_mode == "gralora" and lora_use_dora:
-        raise ValueError("--adapter-mode gralora does not support --lora-use-dora")
-    if lora_init in {"eva", "lora_ga"} and tuning_mode != "lora":
-        raise ValueError(f"--lora-init {lora_init} requires --tuning-mode lora")
-    if adapter_mode != "lora" and tuning_mode != "lora":
-        raise ValueError(f"--adapter-mode {adapter_mode} requires --tuning-mode lora")
-    if lora_use_dora and tuning_mode != "lora":
-        raise ValueError("--lora-use-dora requires --tuning-mode lora")
 
     track_info = TRACKS[track]
     requested_dataset_id = dataset_id
@@ -572,11 +443,7 @@ def run_track1(
     requested_grad_accum = grad_accum
     requested_eval_micro_batch_size = eval_micro_batch_size
     if micro_batch_size == 0:
-        micro_batch_size = (
-            DEFAULT_LORA_MICRO_BATCH_SIZE
-            if tuning_mode == "lora"
-            else DEFAULT_FULL_MICRO_BATCH_SIZE
-        )
+        micro_batch_size = DEFAULT_FULL_MICRO_BATCH_SIZE
     if eval_micro_batch_size == 0:
         eval_micro_batch_size = min(micro_batch_size, DEFAULT_EVAL_MICRO_BATCH_SIZE)
     if grad_accum == 0:
@@ -585,27 +452,13 @@ def run_track1(
     requested_lr = lr
     requested_weight_decay = weight_decay
     requested_optimizer_name = optimizer_name
-    resolved_optimizer_name = (
-        "adamw_fused"
-        if optimizer_name == "auto" and tuning_mode == "lora"
-        else "adamw8bit"
-        if optimizer_name == "auto"
-        else optimizer_name
-    )
+    resolved_optimizer_name = "adamw8bit" if optimizer_name == "auto" else optimizer_name
     wandb_tags_list = [tag.strip() for tag in wandb_tags.split(",") if tag.strip()]
     wandb_enabled = bool(wandb_project) and wandb_mode != "disabled"
     if lr <= 0.0:
-        if tuning_mode == "lora" and resolved_optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit"}:
-            lr = 5.0e-5
-        elif tuning_mode == "lora":
-            lr = 2.0e-4
-        else:
-            lr = 2.0e-5
-    weight_decay = weight_decay if weight_decay >= 0.0 else (0.01 if tuning_mode == "lora" else 0.1)
-    checkpointing_enabled = gradient_checkpointing == "true" or (
-        gradient_checkpointing == "auto"
-        and (tuning_mode == "full" or (tuning_mode == "lora" and micro_batch_size > 1))
-    )
+        lr = 2.0e-5
+    weight_decay = weight_decay if weight_decay >= 0.0 else 0.1
+    checkpointing_enabled = gradient_checkpointing != "false"
     gradient_checkpointing_fallback_used = False
 
     os.environ.setdefault("HF_HOME", str(HF_CACHE))
@@ -637,36 +490,6 @@ def run_track1(
     run_dir.mkdir(parents=True, exist_ok=True)
     eval_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
-    lora_ga_cache_file = None
-    if tuning_mode == "lora" and adapter_mode == "lora_ga" and lora_ga_cache:
-        lora_ga_cache_payload = {
-            "model": model_id,
-            "model_revision": model_revision,
-            "dataset": dataset_id,
-            "dataset_config": dataset_config,
-            "dataset_revision": dataset_revision,
-            "data_mode": data_mode,
-            "loss_mask": "assistant_only" if data_mode == "sft" else "all_tokens",
-            "sequence_packing": DEFAULT_SEQUENCE_PACKING,
-            "packing_strategy": DEFAULT_PACKING_STRATEGY,
-            "seq_len": seq_len,
-            "eval_blocks": eval_blocks,
-            "seed": seed,
-            "adapter_mode": adapter_mode,
-            "lora_r": lora_r,
-            "lora_alpha": lora_alpha,
-            "lora_target_modules": lora_target_modules,
-            "lora_use_rslora": lora_use_rslora,
-            "lora_ga_batches": lora_ga_batches,
-            "lora_ga_micro_batch_size": lora_ga_micro_batch_size,
-            "lora_ga_direction": lora_ga_direction,
-            "lora_ga_scale": lora_ga_scale,
-            "lora_ga_stable_gamma": lora_ga_stable_gamma,
-        }
-        lora_ga_cache_key = hashlib.sha256(
-            json.dumps(lora_ga_cache_payload, sort_keys=True).encode()
-        ).hexdigest()[:20]
-        lora_ga_cache_file = str(CACHE_MOUNT / "loraga" / f"{lora_ga_cache_key}.pt")
 
     bytes_per_gib = 1024**3
     gpu_index = torch.cuda.current_device()
@@ -778,38 +601,12 @@ def run_track1(
         "packing_strategy": DEFAULT_PACKING_STRATEGY,
         "packed_block_size": seq_len,
         "padding_tokens_per_block": 0,
-        "tuning_mode": tuning_mode,
-        "adapter_mode": adapter_mode if tuning_mode == "lora" else None,
+        "tuning_mode": "full",
         "optimizer_name": resolved_optimizer_name,
         "requested_optimizer_name": requested_optimizer_name,
         "gradient_checkpointing": gradient_checkpointing,
         "gradient_checkpointing_enabled": checkpointing_enabled,
         "gradient_checkpointing_fallback_used": gradient_checkpointing_fallback_used,
-        "lora_r": lora_r if tuning_mode == "lora" else None,
-        "lora_alpha": lora_alpha if tuning_mode == "lora" else None,
-        "lora_dropout": lora_dropout if tuning_mode == "lora" else None,
-        "lora_target_modules": lora_target_modules if tuning_mode == "lora" else None,
-        "gralora_k": gralora_k if tuning_mode == "lora" and adapter_mode == "gralora" else None,
-        "lora_use_rslora": lora_use_rslora if tuning_mode == "lora" and adapter_mode != "gralora" else None,
-        "lora_use_dora": lora_use_dora if tuning_mode == "lora" and adapter_mode != "gralora" else None,
-        "lora_init": lora_init if tuning_mode == "lora" and adapter_mode != "gralora" else None,
-        "lora_eva_rho": lora_eva_rho if tuning_mode == "lora" and adapter_mode != "gralora" else None,
-        "lora_eva_batches": lora_eva_batches if tuning_mode == "lora" and adapter_mode != "gralora" else None,
-        "lora_ga_batches": lora_ga_batches if tuning_mode == "lora" and adapter_mode == "lora_ga" else None,
-        "lora_ga_micro_batch_size": lora_ga_micro_batch_size
-        if tuning_mode == "lora" and adapter_mode == "lora_ga"
-        else None,
-        "lora_ga_direction": lora_ga_direction if tuning_mode == "lora" and adapter_mode == "lora_ga" else None,
-        "lora_ga_scale": lora_ga_scale if tuning_mode == "lora" and adapter_mode == "lora_ga" else None,
-        "lora_ga_stable_gamma": lora_ga_stable_gamma
-        if tuning_mode == "lora" and adapter_mode == "lora_ga"
-        else None,
-        "lora_ga_cache": lora_ga_cache if tuning_mode == "lora" and adapter_mode == "lora_ga" else None,
-        "lora_ga_cache_file": lora_ga_cache_file
-        if tuning_mode == "lora" and adapter_mode == "lora_ga"
-        else None,
-        "loraplus_lr_ratio": loraplus_lr_ratio,
-        "loraplus_lr_embedding": loraplus_lr_embedding,
         "muon_lr_adjustment": muon_lr_adjustment,
         "muon_quant_block_size": muon_quant_block_size,
         "normuon_beta2": normuon_beta2,
@@ -1080,50 +877,6 @@ def run_track1(
         flush=True,
     )
 
-    def parse_lora_target_modules(value: str) -> str | list[str]:
-        value = value.strip()
-        if "visual" in value or "lm_head" in value:
-            raise ValueError("--lora-target-modules must not include visual or lm_head modules")
-        if value == "all-linear" or "," not in value:
-            return value
-        return [part.strip() for part in value.split(",") if part.strip()]
-
-    def expand_all_linear_target_modules(
-        current_model: torch.nn.Module,
-        minimum_dimension: int = 1,
-        dimension_divisor: int = 1,
-    ) -> tuple[list[str], int, int]:
-        modules: list[str] = []
-        skipped_small = 0
-        skipped_divisor = 0
-        for name, module in current_model.named_modules():
-            if not name or "lm_head" in name:
-                continue
-            if (
-                name == "visual"
-                or name.startswith("visual.")
-                or ".visual." in name
-                or name.endswith(".visual")
-            ):
-                continue
-            if isinstance(module, torch.nn.Linear):
-                if min(module.weight.shape) < minimum_dimension:
-                    skipped_small += 1
-                    continue
-                if (
-                    dimension_divisor > 1
-                    and (
-                        module.weight.shape[0] % dimension_divisor != 0
-                        or module.weight.shape[1] % dimension_divisor != 0
-                    )
-                ):
-                    skipped_divisor += 1
-                    continue
-                modules.append(name)
-        if not modules:
-            raise RuntimeError("could not expand all-linear adapter targets")
-        return modules, skipped_small, skipped_divisor
-
     def disable_model_cache(current_model: torch.nn.Module) -> None:
         if hasattr(current_model, "config"):
             current_model.config.use_cache = False
@@ -1214,173 +967,12 @@ def run_track1(
     disable_model_cache(model)
     freeze_visual(model)
 
-    if tuning_mode == "lora":
-        if adapter_mode == "gralora":
-            from peft import get_peft_model
-
-            try:
-                from peft import GraloraConfig
-            except ImportError:
-                from peft.tuners.gralora import GraloraConfig
-
-            parsed_gralora_target_modules = parse_lora_target_modules(lora_target_modules)
-            if parsed_gralora_target_modules == "all-linear":
-                (
-                    parsed_gralora_target_modules,
-                    skipped_small,
-                    skipped_divisor,
-                ) = expand_all_linear_target_modules(
-                    model,
-                    dimension_divisor=gralora_k,
-                )
-                print(
-                    f"expanded all-linear to {len(parsed_gralora_target_modules)} GraLoRA target modules "
-                    f"(skipped {skipped_small} small, {skipped_divisor} indivisible by k={gralora_k})",
-                    flush=True,
-                )
-            elif isinstance(parsed_gralora_target_modules, str):
-                if not re.fullmatch(r"[A-Za-z0-9_.]+", parsed_gralora_target_modules):
-                    raise ValueError(
-                        "--adapter-mode gralora requires --lora-target-modules all-linear "
-                        "or explicit module names"
-                    )
-                parsed_gralora_target_modules = [parsed_gralora_target_modules]
-
-            print(
-                "applying GraLoRA "
-                f"target_modules={lora_target_modules!r} r={lora_r} alpha={lora_alpha} "
-                f"dropout={lora_dropout} k={gralora_k}",
-                flush=True,
-            )
-            gralora_config = GraloraConfig(
-                target_modules=parsed_gralora_target_modules,
-                r=lora_r,
-                alpha=lora_alpha,
-                gralora_dropout=lora_dropout,
-                gralora_k=gralora_k,
-                bias="none",
-            )
-            model = get_peft_model(model, gralora_config)
-        else:
-            from peft import LoraConfig, TaskType, get_peft_model
-
-            if lora_init == "eva":
-                from peft import EvaConfig
-            if lora_init == "lora_ga":
-                from peft import LoraGAConfig, preprocess_loraga
-
-            print(
-                "applying LoRA "
-                f"target_modules={lora_target_modules!r} r={lora_r} alpha={lora_alpha} "
-                f"dropout={lora_dropout} use_rslora={lora_use_rslora} "
-                f"use_dora={lora_use_dora} init={lora_init}",
-                flush=True,
-            )
-            lora_init_value: bool | str = True if lora_init == "default" else lora_init
-            parsed_lora_target_modules = parse_lora_target_modules(lora_target_modules)
-            if lora_init == "lora_ga" and parsed_lora_target_modules == "all-linear":
-                parsed_lora_target_modules, skipped_small, skipped_divisor = expand_all_linear_target_modules(
-                    model,
-                    minimum_dimension=2 * lora_r,
-                )
-                print(
-                    f"expanded all-linear to {len(parsed_lora_target_modules)} LoRA-GA target modules "
-                    f"(skipped {skipped_small} modules with min dimension < {2 * lora_r}, "
-                    f"{skipped_divisor} indivisible)",
-                    flush=True,
-                )
-            lora_config_kwargs: dict[str, Any] = {
-                "task_type": TaskType.CAUSAL_LM,
-                "target_modules": parsed_lora_target_modules,
-                "exclude_modules": r".*(visual|lm_head).*",
-                "r": lora_r,
-                "lora_alpha": lora_alpha,
-                "lora_dropout": lora_dropout,
-                "bias": "none",
-                "use_rslora": lora_use_rslora,
-                "use_dora": lora_use_dora,
-                "init_lora_weights": lora_init_value,
-                "ensure_weight_tying": True,
-            }
-            if lora_init == "eva":
-                lora_config_kwargs["eva_config"] = EvaConfig(rho=lora_eva_rho)
-            if lora_init == "lora_ga":
-                lora_config_kwargs["lora_ga_config"] = LoraGAConfig(
-                    direction=lora_ga_direction,
-                    scale=lora_ga_scale,
-                    stable_gamma=lora_ga_stable_gamma,
-                )
-            lora_config = LoraConfig(**lora_config_kwargs)
-            if lora_init == "lora_ga":
-                model.to(device)
-                set_gradient_checkpointing(model, checkpointing_enabled)
-                log_gpu("before_loraga_preprocess")
-                loraga_batch_iter = train_batches(batch_size=lora_ga_micro_batch_size)
-
-                def loraga_train_step() -> None:
-                    model.zero_grad(set_to_none=True)
-                    for _ in range(lora_ga_batches):
-                        batch = next(loraga_batch_iter)
-                        input_ids = batch["input_ids"].to(device, non_blocking=True)
-                        labels = batch["labels"].to(device, non_blocking=True)
-                        with torch.autocast("cuda", dtype=torch.bfloat16):
-                            output = model(
-                                input_ids=input_ids,
-                                attention_mask=torch.ones_like(input_ids, dtype=torch.long),
-                                labels=labels,
-                                use_cache=False,
-                            )
-                            loss = output.loss / lora_ga_batches
-                        loss.backward()
-
-                print(
-                    "preprocessing LoRA-GA "
-                    f"batches={lora_ga_batches} micro_batch_size={lora_ga_micro_batch_size} "
-                    f"direction={lora_ga_direction} scale={lora_ga_scale} "
-                    f"cache={'on' if lora_ga_cache_file else 'off'}",
-                    flush=True,
-                )
-                preprocess_loraga(model, lora_config, loraga_train_step, cache_file=lora_ga_cache_file)
-                model.zero_grad(set_to_none=True)
-                torch.cuda.empty_cache()
-                log_gpu("after_loraga_preprocess")
-            model = get_peft_model(model, lora_config, low_cpu_mem_usage=(lora_init == "eva"))
-
     set_gradient_checkpointing(model, checkpointing_enabled)
 
     model.to(device)
-    if tuning_mode == "lora" and lora_init == "eva":
-        from peft import initialize_lora_eva_weights
-
-        eva_blocks = min(eval_blocks, lora_eva_batches * eval_micro_batch_size)
-
-        def iter_eva_batches():
-            for start in range(0, eva_blocks, eval_micro_batch_size):
-                batch = eval_input_ids[start : start + eval_micro_batch_size].to(device, non_blocking=True)
-                yield {
-                    "input_ids": batch,
-                    "attention_mask": torch.ones_like(batch, dtype=torch.long),
-                }
-
-        print(
-            f"initializing EVA LoRA weights with {eva_blocks} eval blocks "
-            f"rho={lora_eva_rho}",
-            flush=True,
-        )
-        model.eval()
-        with torch.no_grad():
-            initialize_lora_eva_weights(model, iter_eva_batches(), show_progress_bar=False)
-        model.train()
-        set_visual_eval(model)
-        torch.cuda.empty_cache()
     uncompiled_model = model
     torch.cuda.synchronize()
     log_gpu("after_model_to_cuda")
-
-    if tuning_mode == "lora" and resolved_optimizer_name == "lorafa":
-        for name, parameter in model.named_parameters():
-            if "lora_A" in name:
-                parameter.requires_grad_(False)
 
     named_trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     trainable_params = [p for _, p in named_trainable_params]
@@ -1389,15 +981,6 @@ def run_track1(
     trainable_visual_params = [n for n, p in named_trainable_params if "visual" in n]
     if trainable_visual_params:
         raise RuntimeError(f"visual parameters must remain frozen: {trainable_visual_params[:5]}")
-    if tuning_mode == "lora":
-        adapter_param_markers = ("gralora_",) if adapter_mode == "gralora" else ("lora_",)
-        non_adapter_trainable = [
-            n for n, p in named_trainable_params if not any(marker in n for marker in adapter_param_markers)
-        ]
-        if non_adapter_trainable:
-            raise RuntimeError(
-                f"{adapter_mode} mode found non-adapter trainable parameters: {non_adapter_trainable[:5]}"
-            )
     trainable_count = sum(p.numel() for p in trainable_params)
     total_count = sum(p.numel() for p in model.parameters())
     print(f"trainable parameters: {trainable_count:,} / {total_count:,}", flush=True)
@@ -1645,63 +1228,6 @@ def run_track1(
             return loss
 
     def make_optimizer():
-        peft_optimizer_model = getattr(model, "_orig_mod", model)
-        if resolved_optimizer_name in {"loraplus_adamw", "loraplus_adamw8bit"}:
-            from peft.optimizers import create_loraplus_optimizer
-
-            optimizer_kwargs: dict[str, Any] = {
-                "betas": (0.9, 0.95),
-                "eps": 1.0e-8,
-                "loraplus_weight_decay": weight_decay,
-                "loraplus_lr_embedding": loraplus_lr_embedding,
-            }
-            if resolved_optimizer_name == "loraplus_adamw8bit":
-                import bitsandbytes as bnb
-
-                optimizer_cls = bnb.optim.AdamW8bit
-            else:
-                optimizer_cls = torch.optim.AdamW
-                optimizer_kwargs["fused"] = True
-            try:
-                optimizer = create_loraplus_optimizer(
-                    model=peft_optimizer_model,
-                    optimizer_cls=optimizer_cls,
-                    lr=lr,
-                    loraplus_lr_ratio=loraplus_lr_ratio,
-                    **optimizer_kwargs,
-                )
-            except TypeError:
-                if optimizer_kwargs.pop("fused", None) is None:
-                    raise
-                optimizer = create_loraplus_optimizer(
-                    model=peft_optimizer_model,
-                    optimizer_cls=optimizer_cls,
-                    lr=lr,
-                    loraplus_lr_ratio=loraplus_lr_ratio,
-                    **optimizer_kwargs,
-                )
-            print(
-                f"optimizer LoRA+: {resolved_optimizer_name} "
-                f"ratio={loraplus_lr_ratio} base_lr={lr}",
-                flush=True,
-            )
-            return optimizer
-        if resolved_optimizer_name == "lorafa":
-            from peft.optimizers import create_lorafa_optimizer
-
-            print(
-                f"optimizer LoRA-FA: r={lora_r} alpha={lora_alpha} "
-                f"lr={lr} use_rslora={lora_use_rslora}",
-                flush=True,
-            )
-            return create_lorafa_optimizer(
-                model=peft_optimizer_model,
-                r=lora_r,
-                lora_alpha=lora_alpha,
-                lr=lr,
-                weight_decay=weight_decay,
-                use_rslora=lora_use_rslora,
-            )
         if resolved_optimizer_name == "adamw8bit":
             import bitsandbytes as bnb
 
@@ -1923,14 +1449,13 @@ def run_track1(
             run_train_warmup()
         except RuntimeError as exc:
             if not (
-                tuning_mode == "lora"
-                and gradient_checkpointing == "auto"
+                gradient_checkpointing == "auto"
                 and not checkpointing_enabled
                 and is_cuda_oom(exc)
             ):
                 raise
             print(
-                "LoRA warmup OOM without gradient checkpointing; "
+                "warmup OOM without gradient checkpointing; "
                 "retrying warmup with checkpointing enabled",
                 flush=True,
             )
@@ -2093,13 +1618,10 @@ def run_track1(
 
     if save_final:
         unwrapped_model = getattr(model, "_orig_mod", model)
-        final_dir = run_dir / ("final_adapter" if tuning_mode == "lora" else "final_model")
+        final_dir = run_dir / "final_model"
         unwrapped_model.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
-        if tuning_mode == "lora":
-            summary["final_adapter_dir"] = str(final_dir)
-        else:
-            summary["final_model_dir"] = str(final_dir)
+        summary["final_model_dir"] = str(final_dir)
 
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=_json_default) + "\n")
     log_metric({"event": "summary", **summary})
@@ -2143,28 +1665,8 @@ def main(
     dataset_revision: str = "",
     cpt_text_field: str = DEFAULT_CPT_TEXT_FIELD,
     data_mode: str = "",
-    tuning_mode: str = "lora",
-    adapter_mode: str = "",
     optimizer_name: str = "auto",
     gradient_checkpointing: str = "auto",
-    lora_r: int = 32,
-    lora_alpha: int = 64,
-    lora_dropout: float = 0.0,
-    lora_target_modules: str = "all-linear",
-    gralora_k: int = DEFAULT_GRALORA_K,
-    lora_use_rslora: bool = True,
-    lora_use_dora: bool = False,
-    lora_init: str = "default",
-    lora_eva_rho: float = DEFAULT_LORA_EVA_RHO,
-    lora_eva_batches: int = 16,
-    lora_ga_batches: int = 4,
-    lora_ga_micro_batch_size: int = 1,
-    lora_ga_direction: str = "ArB2r",
-    lora_ga_scale: str = "stable",
-    lora_ga_stable_gamma: int = 16,
-    lora_ga_cache: bool = False,
-    loraplus_lr_ratio: float = DEFAULT_LORAPLUS_LR_RATIO,
-    loraplus_lr_embedding: float = 1.0e-6,
     muon_lr_adjustment: str = "match_rms_adamw",
     muon_quant_block_size: int = DEFAULT_MUON_QUANT_BLOCK_SIZE,
     normuon_beta2: float = DEFAULT_NORMUON_BETA2,
@@ -2191,18 +1693,16 @@ def main(
     """Run a modded-continued-training track on Modal.
 
     --track selects the competition track (1=30min, 2=5min, 3=2hr).
-    All tracks default to packed CPT/LoRA on the canonical ConlangCrafter
-    corpus. Pass --data-mode sft for the legacy UltraChat SFT path.
-    When --minutes is 0 (default), the track's default budget is used.
-    Set --record-description to save a competition record on success.
+    All tracks default to packed CPT full fine-tuning on the canonical
+    ConlangCrafter corpus. Pass --data-mode sft for the legacy UltraChat
+    SFT path. When --minutes is 0 (default), the track's default budget
+    is used. Set --record-description to save a competition record.
     """
 
     if track not in TRACKS:
         raise ValueError(f"--track must be one of: {', '.join(TRACKS.keys())}")
     if not data_mode:
         data_mode = "cpt"
-    if not adapter_mode:
-        adapter_mode = DEFAULT_ADAPTER_MODE if tuning_mode == "lora" and data_mode == "sft" else "lora"
 
     if minutes == 0.0:
         minutes = TRACKS[track]["default_minutes"]
@@ -2225,28 +1725,8 @@ def main(
         dataset_revision=dataset_revision,
         cpt_text_field=cpt_text_field,
         data_mode=data_mode,  # type: ignore[arg-type]
-        tuning_mode=tuning_mode,  # type: ignore[arg-type]
-        adapter_mode=adapter_mode,  # type: ignore[arg-type]
         optimizer_name=optimizer_name,
         gradient_checkpointing=gradient_checkpointing,  # type: ignore[arg-type]
-        lora_r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        lora_target_modules=lora_target_modules,
-        gralora_k=gralora_k,
-        lora_use_rslora=lora_use_rslora,
-        lora_use_dora=lora_use_dora,
-        lora_init=lora_init,
-        lora_eva_rho=lora_eva_rho,
-        lora_eva_batches=lora_eva_batches,
-        lora_ga_batches=lora_ga_batches,
-        lora_ga_micro_batch_size=lora_ga_micro_batch_size,
-        lora_ga_direction=lora_ga_direction,
-        lora_ga_scale=lora_ga_scale,
-        lora_ga_stable_gamma=lora_ga_stable_gamma,
-        lora_ga_cache=lora_ga_cache,
-        loraplus_lr_ratio=loraplus_lr_ratio,
-        loraplus_lr_embedding=loraplus_lr_embedding,
         muon_lr_adjustment=muon_lr_adjustment,  # type: ignore[arg-type]
         muon_quant_block_size=muon_quant_block_size,
         normuon_beta2=normuon_beta2,

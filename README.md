@@ -19,13 +19,13 @@ Higher is better. The current record is **+0.540**.
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|---:|---|---|---|---|
-| 1 | **+0.540** | ConlangCrafter CPT/LoRA, seed 1337, AdamW fused, lr 2e-4, mb 8, flex-attention, max-autotune-no-cudagraphs | 2026-05-28 | [summary](records/track_1_30min/2026-05-28_ConlangCrafter_CPT_Track1_seed1337/summary.json) | @levstamb |
+| 1 | **+0.540** | ConlangCrafter CPT full fine-tune, seed 1337, AdamW fused, lr 2e-4, mb 8, LoRA r=32, flex-attention, max-autotune-no-cudagraphs (pre-full-FT-default snapshot) | 2026-05-28 | [summary](records/track_1_30min/2026-05-28_ConlangCrafter_CPT_Track1_seed1337/summary.json) | @levstamb |
 
 ### Track 2 — 5 minutes
 
 | # | Loss drop | Description | Date | Log | Contributors |
 |---|---:|---|---|---|---|
-| 1 | **+0.510** | ConlangCrafter CPT/LoRA, baseline 0.854 → final 0.345, 101 steps, 3.31M tokens | 2026-05-27 | [Modal](https://modal.com/apps/tear-labs-43657/main/ap-ZQyBFDPmLUkkHl9O6JmUGB) | — |
+| 1 | **+0.510** | ConlangCrafter CPT LoRA, baseline 0.854 → final 0.345, 101 steps, 3.31M tokens (pre-full-FT-default snapshot) | 2026-05-27 | [Modal](https://modal.com/apps/tear-labs-43657/main/ap-ZQyBFDPmLUkkHl9O6JmUGB) | — |
 
 ### Track 3 — 2 hours
 
@@ -105,8 +105,7 @@ with that directory and update the leaderboard table above.
    `--compile-mode`) and `dynamic=False`, or use `coordinate_descent_tuning`.
 
 Everything else — optimizer, LR schedule, batch size, attention impl,
-adapter mode, model-aware optimizations, packing strategy, mixed precision —
-is fair game.
+model-aware optimizations, packing strategy, mixed precision — is fair game.
 
 ## Fixed inputs
 
@@ -134,8 +133,8 @@ The Modal image (also defined in `main.py`) provides:
 - NVIDIA CUDA devel base so source-built extensions have `nvcc`
 - `attn_implementation="flex_attention"` by default; `flash-attn` is also installed
 - `flash-linear-attention`, `causal-conv1d`, and `tilelang` for Qwen3.5 Gated DeltaNet
-- `peft` with LoRA/GraLoRA + a range of init strategies (PiSSA, OLoRA, EVA, LoRA-GA, orthogonal)
-- Optional Muon, Muon8 (8-bit blockwise), NorMuon, LoRA+, and LoRA-FA optimizers
+- Full model fine-tuning (no adapters) with gradient checkpointing on by default to fit 4B on a single H100
+- Optimizers: `adamw_fused`, `adamw8bit`, Muon, Muon8 (8-bit blockwise momentum), NorMuon
 - `bitsandbytes` for `AdamW8bit`
 - Sequence packing without padding into fixed `seq_len` blocks
 - W&B (offline or online) via `--wandb-project`
