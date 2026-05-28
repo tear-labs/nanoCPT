@@ -137,6 +137,56 @@ Takeaways:
   **+0.389** — the per-group LR convention matters; without it Muon
   underutilizes its update budget.
 
+#### Muon LR sweep (seed 1337, H100 SXM5, same data/seq/eval as above)
+
+Because Muon almost always beats AdamW on LM training and our +0.486 was
+suspiciously close to AdamW's +0.497, we did a full LR sweep across both
+of our supported `lr_adjustment` modes. Two modes differ in how they
+scale the post-Newton-Schulz update:
+
+- `match_rms_adamw` (default): `lr * 0.2 * sqrt(max(rows, cols))` — the
+  Moonshot Kimi convention. Designed so you can reuse AdamW-sized LRs.
+- `original` (Keller Jordan): `lr * sqrt(max(1, rows/cols))` — what
+  modded-nanogpt uses. Needs LRs 10-25× larger to get equivalent
+  per-step magnitude.
+
+| `lr_adjustment` | `muon_lr` | drop | final | steps | Notes |
+|---|---:|---:|---:|---:|---|
+| `match_rms_adamw` | 2e-5  | +0.3841 | 0.470 | 77 | Moonshot's Qwen2.5-7B SFT recipe |
+| `match_rms_adamw` | **2e-4** | **+0.4862** | **0.368** | **86** | **Peak; leaderboard** |
+| `match_rms_adamw` | 5e-4  | +0.4373 | 0.417 | 66 | NVL confound; still below 2e-4 |
+| `original`         | 5e-3  | +0.4592 | 0.395 | 84 | Keller-Jordan scale, FT-conservative |
+| `original`         | 1e-2  | +0.4084 | 0.446 | 74 | Modded-nanogpt pretraining scale; over-LR here |
+
+Both modes have a clear peak; the peaks are within 0.03 of each other
+and **neither beats AdamW fused** at this 5-min Track 2 budget. The
+Muon implementation passes audit (Newton-Schulz with the standard
+`(3.4445, -4.7750, 2.0315)` coefficients in bfloat16, Nesterov
+momentum, fp32 momentum buffer, `torch.matmul` kernels). The
+optimizer code is fine; the result is real.
+
+**Probable explanations** for AdamW winning at this budget:
+
+1. Track 2's 5-minute window completes only ~80 optimization steps on a
+   single H100. Muon's documented LM advantages come from many more
+   steps (modded-nanogpt records compare at thousands to tens of
+   thousands of steps); 80 steps may be too few for the Newton-Schulz
+   spectral-shaping benefit to compound. Track 3 (2 hours, ~2,000
+   steps) is the natural follow-up.
+2. Fine-tuning a model already converged on a different distribution
+   (Qwen pretrain → synthetic conlang) may be a fundamentally
+   different regime from from-scratch LM training. Moonshot's Kimi
+   numbers show Muon matching but not necessarily *beating* AdamW for
+   SFT in their published recipes.
+3. The conlang corpus is small and lexically repetitive; AdamW's
+   per-parameter adaptive LR may be more efficient for fitting a
+   narrow distribution than Muon's spectral approach.
+
+The 4-way ablation table above keeps `adamw_fused` as the canonical
+default. Anyone iterating on optimizers should re-test at Track 1
+(30 min) or Track 3 (2 hr) before concluding the Muon family is
+strictly worse for this challenge.
+
 ## Interpretation
 
 1. **Distribution distance is the dominant lever for loss-drop magnitude.**
