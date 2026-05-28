@@ -83,14 +83,15 @@ case "${1:-}" in
     shift
     exec "${cmd[@]}" --tuning-mode full --track 3 --data-mode cpt "$@"
     ;;
-  # Foreign-distribution CPT shortcuts. CONLANG_DATASET_ID points at the HF
-  # repo published by scripts/synthesize_conlang_cpt.py + push_conlang_dataset.py.
-  # SUMERIAN_DATASET_ID defaults to the public SumTablets release.
+  # ConlangCrafter CPT shortcuts. The CPT default dataset in main.py already
+  # points at TearedModels/conlangcrafter-cpt-bd412d52, so these are mostly
+  # convenience aliases. Override CONLANG_DATASET_ID to use a different
+  # conlang corpus you published yourself.
   conlang-smoke)
     shift
     exec "${cmd[@]}" \
       --data-mode cpt --adapter-mode lora \
-      --dataset-id "${CONLANG_DATASET_ID:?set CONLANG_DATASET_ID to your HF conlang corpus (e.g. user/conlangcrafter-cpt-XXXX)}" \
+      ${CONLANG_DATASET_ID:+--dataset-id "$CONLANG_DATASET_ID"} \
       --minutes 0.1 --eval-blocks 2 --micro-batch-size 4 --grad-accum 1 \
       --no-compile-model --no-compile-warmup --attn-implementation sdpa \
       "$@"
@@ -98,37 +99,13 @@ case "${1:-}" in
   conlang-track2)
     shift
     exec "${cmd[@]}" --track 2 --data-mode cpt --adapter-mode lora \
-      --dataset-id "${CONLANG_DATASET_ID:?set CONLANG_DATASET_ID to your HF conlang corpus}" \
+      ${CONLANG_DATASET_ID:+--dataset-id "$CONLANG_DATASET_ID"} \
       "$@"
     ;;
   conlang-track1)
     shift
     exec "${cmd[@]}" --track 1 --data-mode cpt --adapter-mode lora \
-      --dataset-id "${CONLANG_DATASET_ID:?set CONLANG_DATASET_ID to your HF conlang corpus}" \
-      "$@"
-    ;;
-  sumerian-smoke)
-    shift
-    exec "${cmd[@]}" \
-      --data-mode cpt --adapter-mode lora \
-      --dataset-id "${SUMERIAN_DATASET_ID:-colesimmons/SumTablets}" \
-      --cpt-text-field transliteration \
-      --minutes 0.1 --eval-blocks 2 --micro-batch-size 4 --grad-accum 1 \
-      --no-compile-model --no-compile-warmup --attn-implementation sdpa \
-      "$@"
-    ;;
-  sumerian-track2)
-    shift
-    exec "${cmd[@]}" --track 2 --data-mode cpt --adapter-mode lora \
-      --dataset-id "${SUMERIAN_DATASET_ID:-colesimmons/SumTablets}" \
-      --cpt-text-field transliteration \
-      "$@"
-    ;;
-  sumerian-track1)
-    shift
-    exec "${cmd[@]}" --track 1 --data-mode cpt --adapter-mode lora \
-      --dataset-id "${SUMERIAN_DATASET_ID:-colesimmons/SumTablets}" \
-      --cpt-text-field transliteration \
+      ${CONLANG_DATASET_ID:+--dataset-id "$CONLANG_DATASET_ID"} \
       "$@"
     ;;
   *)

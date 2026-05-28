@@ -1,4 +1,4 @@
-# Foreign-distribution CPT findings (2026-05-27/28)
+# ConlangCrafter CPT findings (2026-05-27/28)
 
 ## Question
 
@@ -7,7 +7,7 @@ produces a `baseline_eval_loss − final_eval_loss` of roughly **+0.05** over a
 30-minute LoRA fine-tune. That is barely above noise. We wanted a dataset that
 gives a **pronounced** loss-drop signal — large enough that experiments can
 distinguish good and bad training choices clearly, and large enough that the
-"score" number tells a meaningful story.
+score number tells a meaningful story.
 
 ## Hypothesis
 
@@ -17,62 +17,67 @@ and there is little headroom for training to improve it. Picking a dataset
 that is **demonstrably outside** the pretraining distribution should give a
 high baseline loss and a much larger achievable drop.
 
-## Candidates considered
+## Choice: ConlangCrafter synthetic conlang
 
-| Candidate | Tokens | Decipherment | Status |
-|---|---|---|---|
-| **ConlangCrafter** synthetic conlang (one of 64 specs in [malper/ConlangCrafter](https://huggingface.co/datasets/malper/ConlangCrafter), arXiv [2508.06094](https://arxiv.org/abs/2508.06094)) | ~11M (generated) | n/a — fully synthetic | **Selected** |
-| **SumTablets** Sumerian cuneiform transliterations ([colesimmons/SumTablets](https://huggingface.co/datasets/colesimmons/SumTablets), arXiv [2602.22200](https://arxiv.org/abs/2602.22200)) | ~10–15M (train split, 82,452 rows, 30.2M chars) | Deciphered | **Selected** |
-| **FineMath** baseline (`HuggingFaceTB/finemath`) | — | n/a | Anchor |
-| Linear A | ~7,400 signs total across 1,427 inscriptions | **Undeciphered** | **Rejected.** 3+ orders of magnitude too small; without decipherment there is no grammar regularity to learn, so any loss drop would be memorization. |
-| Other undeciphered scripts (Indus, Rongorongo, Voynich, Proto-Elamite, Phaistos Disc) | thousands of signs | Undeciphered | **Rejected** for the same reasons. |
-| Tibetan (TIBSTC, `pkupie/mc2_corpus`) | 11B | Living | **Rejected** — well-represented in modern pretraining, not OOD enough. |
+A constructed language synthesized one-shot via Vertex AI Gemini 3.5 Flash
+against a [ConlangCrafter](https://arxiv.org/abs/2508.06094) language spec
+(`bd412d52`, DeepSeek-R1-generated, 131 lexicon words, polysynthetic, IPA
+with tones and clicks). Published as
+[`TearedModels/conlangcrafter-cpt-bd412d52`](https://huggingface.co/datasets/TearedModels/conlangcrafter-cpt-bd412d52).
 
-## Method
+### Why this and not alternatives
 
-CPT (continued pretraining), not SFT. Raw text packed into `seq_len`=4096
-blocks, all-token loss. Identical hyperparameters across all three candidates
-(LoRA rank 32, AdamW fused, lr 2e-4, micro_batch_size 8, flex-attention,
-`max-autotune-no-cudagraphs` compile, 64-block held-out eval).
+| Considered | Status | Reason |
+|---|---|---|
+| **ConlangCrafter synthetic conlang** | **Selected** | Guaranteed novel (the language did not exist before synthesis), infinitely extensible (re-run the script for more tokens), deterministic by spec id, no Qwen pretraining exposure. |
+| SumTablets ([colesimmons/SumTablets](https://huggingface.co/datasets/colesimmons/SumTablets), arXiv [2602.22200](https://arxiv.org/abs/2602.22200)) | Considered, dropped | Sumerian cuneiform transliterations, 82,452 rows / 30M chars. Gave a bigger Track 2 absolute drop (+1.09 vs the conlang's +0.51), but it's fixed-size: at Track 3 budgets (~80M tokens consumed) the model would see each tablet 5–8× and start memorizing rather than learning structure, polluting the signal. The conlang scales by re-running synthesis. |
+| Linear A and other undeciphered scripts (Indus, Rongorongo, Voynich, Proto-Elamite, Phaistos Disc) | Rejected | Corpora are tiny (Linear A: ~7,400 signs across 1,427 inscriptions; others similar). Three-plus orders of magnitude too small, and without decipherment there is no grammar regularity to learn — any loss drop would be memorization. |
+| Tibetan (TIBSTC, `pkupie/mc2_corpus`) | Rejected | 11B tokens, but well-represented in modern pretraining — not OOD enough. |
 
-Each candidate gets a Track 2 (5-minute) run. The winner gets a Track 1
-(30-minute) run.
+## Synthesis pipeline (`scripts/synthesize_conlang_cpt.py`)
 
-The synthetic conlang corpus was generated one-shot via Vertex AI Gemini 3.5
-Flash (`scripts/synthesize_conlang_cpt.py`):
-
-- One ConlangCrafter spec (`bd412d52`, DeepSeek-R1-generated, 131 lexicon
-  words, polysynthetic, IPA with tones and clicks) as the system prompt.
-- Rotated topic seeds across 50 prompts for diversity.
+- One ConlangCrafter spec (full phonology + grammar + lexicon) as the system
+  prompt, ~9.4K input tokens per call.
+- Rotated topic seeds across 50 prompts for content diversity (village at
+  dawn, hunter and prey, harvest song, etc.).
 - Per-chunk quality gate: lexicon-overlap minimum (substring match, ≥50%),
-  English-word ratio maximum (≤5%), minimum length (400 chars). Failed chunks
-  retried up to 2× with a different topic.
-- `thinking_config=ThinkingConfig(thinking_budget=0)` — without this Gemini
+  English-word ratio maximum (≤5%), minimum length (400 chars). Failed
+  chunks retried up to 2× with a different topic.
+- `thinking_config=ThinkingConfig(thinking_budget=0)` — without this, Gemini
   3.5 Flash silently burns the entire output budget on thoughts and returns
-  empty text. **Important debugging finding.**
+  empty text. **Critical debugging finding.**
 - `max_output_tokens=8192` with headroom — when the model hits MAX_TOKENS,
   the truncated final part can have `text=None` and `resp.text` returns `""`
   even after thousands of generated tokens. Always leave slack.
 - Async concurrency 32 against Vertex on `gemini-3.5-flash` (global endpoint).
-- Result: 3,077 chunks, 10.99M output tokens, 13.26M chars, 27 minutes,
-  0 final rejects (all gated chunks succeeded on retry).
-- Cost: ~$5–20 (Flash pricing).
-- Published: [`TearedModels/conlangcrafter-cpt-bd412d52`](https://huggingface.co/datasets/TearedModels/conlangcrafter-cpt-bd412d52).
+- Resumable JSONL output during the run; converts to parquet at the end.
+
+### Generation stats (one-shot run, 2026-05-27)
+
+- 3,077 chunks accepted, 0 final rejects (all gated chunks succeeded on retry).
+- 10.99M output tokens, 13.26M chars.
+- 1607s (27 min) wallclock at concurrency 32.
+- Cost: ~$5–20 on Flash pricing.
 
 ## Results
 
-### Track 2 — 5 minutes (3-way sweep)
+### Track 2 — 5 minutes
+
+Identical hyperparameters across candidates (LoRA rank 32, AdamW fused,
+lr 2e-4, micro_batch_size 8, flex-attention, `max-autotune-no-cudagraphs`,
+64-block held-out eval).
 
 | Dataset | Eval-loss drop | Baseline | Final | Steps | Tokens |
 |---|---:|---:|---:|---:|---:|
-| FineMath (legacy CPT) | **−0.034** ❌ | 1.431 | 1.466 | 101 | 3.31M |
-| ConlangCrafter (synthetic) | **+0.510** ✅ | 0.854 | 0.345 | 101 | 3.31M |
-| SumTablets (Sumerian) | **+1.092** ✅✅ | 1.946 | 0.855 | 99 | 3.24M |
+| FineMath (legacy CPT, anchor) | **−0.034** ❌ | 1.431 | 1.466 | 101 | 3.31M |
+| **ConlangCrafter** (selected) | **+0.510** ✅ | 0.854 | 0.345 | 101 | 3.31M |
+| SumTablets (reference) | +1.092 | 1.946 | 0.855 | 99 | 3.24M |
 
-Both foreign datasets dwarf the FineMath signal (and the prior Hermes-SFT
-Track 1 record of +0.052). Sumerian gives the largest absolute drop;
-ConlangCrafter gives the largest **relative** drop (60% of baseline loss
-eliminated) and the lowest final loss.
+Both foreign datasets dwarf the FineMath signal and the prior Hermes-SFT
+Track 1 record of +0.052. SumTablets gives a larger absolute drop in 5 min
+because Qwen's tokenizer treats Latin-with-subscripts transliteration as
+many unfamiliar tokens, inflating both baseline and headroom. ConlangCrafter
+gives the lowest final loss and is the chosen canonical because it scales.
 
 ### Track 1 — 30 minutes (ConlangCrafter, seed 1337)
 
@@ -86,8 +91,9 @@ eliminated) and the lowest final loss.
 | supervised tok/s | 10,989 |
 | peak GPU util | 100% |
 
+Snapshot:
 [`records/track_1_30min/2026-05-28_ConlangCrafter_CPT_Track1_seed1337/`](../records/track_1_30min/2026-05-28_ConlangCrafter_CPT_Track1_seed1337/)
-contains the full snapshot ([Modal run](https://modal.com/apps/tear-labs-43657/main/ap-lv4L5notEjWXBIJhrpNcOe)).
+· [Modal run](https://modal.com/apps/tear-labs-43657/main/ap-lv4L5notEjWXBIJhrpNcOe).
 
 Roughly **10× the previous best Track 1 signal** (Hermes-SFT GraLoRA at
 +0.052).
@@ -95,11 +101,11 @@ Roughly **10× the previous best Track 1 signal** (Hermes-SFT GraLoRA at
 ## Interpretation
 
 1. **Distribution distance is the dominant lever for loss-drop magnitude.**
-   Going from in-distribution (FineMath, baseline 1.43) to clearly OOD
-   (Sumerian, baseline 1.95) or fully novel (synthetic conlang, baseline
-   0.85) changes the achievable drop by 1–2 orders of magnitude. Optimizer,
-   adapter, and schedule choices — which dominated prior iteration logs —
-   are much smaller effects than the dataset choice.
+   Going from in-distribution (FineMath, baseline 1.43) to fully novel
+   (synthetic conlang, baseline 0.85) changes the achievable drop by 1–2
+   orders of magnitude. Optimizer, adapter, and schedule choices — which
+   dominated prior iteration logs — are much smaller effects than the
+   dataset choice.
 
 2. **The synthetic conlang has a counter-intuitively *low* baseline loss
    (~0.85) despite being novel.** Best hypothesis: the IPA/tone-mark
@@ -107,68 +113,55 @@ Roughly **10× the previous best Track 1 signal** (Hermes-SFT GraLoRA at
    tokenizer's distribution model can predict relatively well from local
    bigram statistics, plus the corpus has repetitive lexical structure (root
    words like `k'u`, `hun`, `wa.la` recur frequently). The model can predict
-   "next sub-character within a known root" without knowing the language. So
-   the *absolute* drop is smaller than Sumerian's, even though the conlang
-   is more OOD.
+   "next sub-character within a known root" without knowing the language. The
+   *relative* drop (60% of baseline eliminated) is still huge.
 
-3. **Sumerian has a high baseline (1.95) because Latin-alphabet
-   transliteration with subscripts like `uri₅{ki}ma` tokenizes into long,
-   unfamiliar Qwen sequences.** The drop is large because the model genuinely
-   learns the transliteration structure (case endings, determinatives like
-   `{ki}`/`{d}`, surface/column markers) from very few epochs.
-
-4. **5 minutes captures ~95% of the drop on the conlang.** Track 2
-   (5min) gave +0.510; Track 1 (30min) gave +0.540 — diminishing returns
-   after the model fits the lexical inventory. This suggests the conlang
-   corpus may not be the best fit for a 30-min budget; a *harder* OOD source
-   would let more of the 30-minute budget translate into eval-loss progress.
-
-5. **Both candidates pass the "+0 drop" record-eligibility rule by huge
-   margins** with no tuning. Future record iterations on these datasets
-   should focus on the systems side (better optimizer, higher tok/s, better
-   adapter init), not on chasing additional dataset shift.
+3. **5 minutes captures ~95% of the drop on the conlang.** Track 2
+   gave +0.510; Track 1 gave +0.540 — diminishing returns after the model
+   fits the lexical inventory. Future iterations should either pick a less
+   compressible conlang spec (Latin-script alternatives in the
+   `malper/ConlangCrafter` set may have higher baselines) or move to a
+   larger corpus to delay saturation.
 
 ## Caveats
 
-- **Single-seed Track 1** for the conlang. Promoting to a record claim under
-  the README's p<0.01 rule needs seeds 2027 and 4099. Commands are in the
-  README's Track 1 table.
+- **Single-seed Track 1.** Promoting to a record claim under the README's
+  p<0.01 rule needs seeds 2027 and 4099. Commands are in the README's
+  Track 1 table.
 - **Tokenization sensitivity.** The conlang's low baseline loss is partly a
   tokenization artifact (sub-character IPA pieces). A different base model
   with a different tokenizer would likely show different baseline numbers
   but the same general "drop is much larger than ultrachat" story.
-- **Train/eval split for the conlang.** The held-out eval blocks are
-  constructed from the unshuffled stream's leading documents (same as the
-  FineMath path), which means our eval is drawn from the same chunk
-  distribution as training. For a truly clean evaluation, generate a separate
-  held-out set with `--target-tokens` smaller and a different seed.
-- **The conlang corpus is one specific language (`bd412d52`).** Different
-  ConlangCrafter languages would give different baseline/drop numbers. We
-  picked the longest-spec DeepSeek-R1 language; nothing about the choice was
-  optimized for "easiest learning."
-- **SumTablets baseline run was not retried for noise.** The +1.09 drop is a
-  single observation. Repeat with multiple seeds before treating it as a
-  stable headline.
-- **Catastrophic forgetting on the base task.** We did not evaluate whether
-  the CPT-on-conlang or CPT-on-Sumerian adapters degrade English performance.
-  That matters if these adapters are intended as anything other than
-  benchmark-loss-drop targets.
+- **Eval set construction.** The held-out eval blocks are drawn from the
+  unshuffled stream's leading documents (same as the legacy FineMath path),
+  so eval is from the same chunk distribution as training. For a cleaner
+  evaluation, generate a separate held-out set with a different seed.
+- **One specific language (`bd412d52`).** Different ConlangCrafter languages
+  would give different baseline/drop numbers. We picked the longest-spec
+  DeepSeek-R1 language; nothing about the choice was optimized for "easiest
+  learning."
+- **Catastrophic forgetting on the base task is unmeasured.** We did not
+  evaluate whether the CPT-on-conlang adapter degrades English performance.
 
 ## How to reproduce
 
 ```bash
-# 1. Regenerate the conlang corpus and push to your HF account.
+# 1. Smoke the synthesis pipeline (~3 min, ~$0.10).
 source ~/.config/.env.global   # provides VERTEXAI_PROJECT etc.
+uv run python scripts/synthesize_conlang_cpt.py --smoke
+
+# 2. Full corpus generation (~30 min, ~$5-20 on Flash).
 uv run python scripts/synthesize_conlang_cpt.py --target-tokens 10_000_000 --concurrency 32
+
+# 3. Publish to HF.
 uv run python scripts/push_conlang_dataset.py data/conlang_cpt/<language_id>
 
-# 2. Track 2 (5-min) sweep.
-export CONLANG_DATASET_ID=<your-hf-user>/conlangcrafter-cpt-<language_id>
-./run.sh conlang-track2
-./run.sh sumerian-track2     # uses colesimmons/SumTablets + --cpt-text-field transliteration
-./run.sh track2              # FineMath baseline
+# 4. Use as the CPT default (no env var needed — main.py defaults
+#    to TearedModels/conlangcrafter-cpt-bd412d52). Override with
+#    `export CONLANG_DATASET_ID=...` to point at your own corpus.
+./run.sh track2                  # 5-min sprint
+./run.sh cpt-track1              # 30-min Track 1
 
-# 3. Track 1 record runs.
 ./run.sh conlang-track1 --seed 1337 --record-description "ConlangCrafter CPT seed1337" --record-contributors "@you"
 ./run.sh conlang-track1 --seed 2027 --record-description "ConlangCrafter CPT seed2027" --record-contributors "@you"
 ./run.sh conlang-track1 --seed 4099 --record-description "ConlangCrafter CPT seed4099" --record-contributors "@you"
@@ -179,4 +172,3 @@ export CONLANG_DATASET_ID=<your-hf-user>/conlangcrafter-cpt-<language_id>
 - ConlangCrafter (Alper et al., 2026), arXiv [2508.06094](https://arxiv.org/abs/2508.06094).
 - SumTablets (Simmons, 2024), arXiv [2602.22200](https://arxiv.org/abs/2602.22200).
 - Linear A Digital Corpus (Salgarella & Castellan, 2015), [aclanthology W15-3715](https://aclanthology.org/W15-3715.pdf).
-- "All Code, No Thought": ciphered reasoning is OOD (Oct 2025), arXiv [2510.09714](https://arxiv.org/pdf/2510.09714).

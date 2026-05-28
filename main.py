@@ -28,9 +28,14 @@ HF_CACHE = CACHE_MOUNT / "huggingface"
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B-Base"
 DEFAULT_MODEL_REVISION = "1001bb4d826a52d1f399e183466143f4da7b741b"
-DEFAULT_DATASET_ID = "HuggingFaceTB/finemath"
-DEFAULT_DATASET_CONFIG = "finemath-4plus"
-DEFAULT_DATASET_REVISION = "e92b25a616738fe95dc186b64dfb19f9c8525594"
+DEFAULT_DATASET_ID = "TearedModels/conlangcrafter-cpt-bd412d52"
+DEFAULT_DATASET_CONFIG = ""
+DEFAULT_DATASET_REVISION = "5cfd047a92023011326e8383d45d97db22add909"
+# Legacy CPT dataset — kept so the records under records/track_1_30min/2026-05-*
+# can be reproduced. Pass --dataset-id explicitly to use it.
+LEGACY_CPT_DATASET_ID = "HuggingFaceTB/finemath"
+LEGACY_CPT_DATASET_CONFIG = "finemath-4plus"
+LEGACY_CPT_DATASET_REVISION = "e92b25a616738fe95dc186b64dfb19f9c8525594"
 DEFAULT_SFT_DATASET_ID = "HuggingFaceH4/ultrachat_200k"
 DEFAULT_SFT_DATASET_CONFIG = ""
 DEFAULT_SFT_DATASET_REVISION = "8049631c405ae6576f93f445c6b8166f76f5505a"
@@ -175,8 +180,11 @@ def _resolve_dataset_defaults(
             return DEFAULT_SFT_DATASET_ID, DEFAULT_SFT_DATASET_CONFIG, DEFAULT_SFT_DATASET_REVISION
         return DEFAULT_DATASET_ID, DEFAULT_DATASET_CONFIG, DEFAULT_DATASET_REVISION
 
-    legacy_defaults = (DEFAULT_DATASET_ID, DEFAULT_DATASET_CONFIG, DEFAULT_DATASET_REVISION)
-    if data_mode == "sft" and (dataset_id, dataset_config, dataset_revision) == legacy_defaults:
+    # Older CLI invocations may pass the legacy FineMath CPT defaults explicitly
+    # even when running in SFT mode (back when those were the only defaults).
+    # Redirect those to the SFT defaults so existing scripts don't break.
+    legacy_cpt_tuple = (LEGACY_CPT_DATASET_ID, LEGACY_CPT_DATASET_CONFIG, LEGACY_CPT_DATASET_REVISION)
+    if data_mode == "sft" and (dataset_id, dataset_config, dataset_revision) == legacy_cpt_tuple:
         return DEFAULT_SFT_DATASET_ID, DEFAULT_SFT_DATASET_CONFIG, DEFAULT_SFT_DATASET_REVISION
     return dataset_id, dataset_config, dataset_revision
 
