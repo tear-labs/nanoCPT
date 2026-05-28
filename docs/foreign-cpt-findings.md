@@ -109,12 +109,17 @@ tail on embed/lm\_head/1D params), wired via the new `--muon-lr` and
 `muon_lr=2e-4`, `adamw_tail_lr=2e-5` (a 10× ratio — Muon's normalized
 updates need a larger nominal LR).
 
-| Rank | Optimizer            | Eval-loss drop | Baseline | Final | Steps | Compile/warmup | GPU SKU |
-|---:|---|---:|---:|---:|---:|---:|---|
-| 1  | **adamw\_fused**     | **+0.4972**    | 0.854    | 0.357 | 77    | 238s           | H100 SXM5 |
-| 2  | muon8 hybrid         | +0.4868        | 0.854    | 0.368 | 82    | 219s           | H100 SXM5 |
-| 3  | muon hybrid          | +0.4862        | 0.854    | 0.368 | 86    | 218s           | H100 SXM5 |
-| 4  | normuon hybrid       | +0.4570        | 0.854    | 0.397 | 65    | 234s           | H100 NVL (slower) |
+All four runs landed on H100 SXM5 80GB HBM3 (the NorMuon run was
+re-executed after an initial allocation on H100 NVL produced an unfair
+~21 % step-count deficit; see `AGENTS.md` "Ablation runs must be on the
+same GPU SKU").
+
+| Rank | Optimizer            | Eval-loss drop | Baseline | Final | Steps | Compile/warmup |
+|---:|---|---:|---:|---:|---:|---:|
+| 1  | **adamw\_fused**     | **+0.4972**    | 0.854    | 0.357 | 77    | 238s           |
+| 2  | muon8 hybrid         | +0.4868        | 0.854    | 0.368 | 82    | 219s           |
+| 3  | muon hybrid          | +0.4862        | 0.854    | 0.368 | 86    | 218s           |
+| 4  | normuon hybrid       | +0.4612        | 0.854    | 0.393 | 81    | 244s           |
 
 Takeaways:
 - **AdamW fused wins at the 5-min Track 2 budget**, so it is the new
@@ -124,10 +129,10 @@ Takeaways:
 - **Muon8 ≈ Muon**: 8-bit blockwise momentum costs basically nothing in
   loss drop here. Useful if optimizer-state memory becomes a constraint
   at larger Track-3 budgets or different model sizes.
-- **NorMuon's lower rank is partly a confound**: it landed on an
-  H100 NVL where step time was ~25 % higher, so it completed 65 steps
-  vs 77-86 for the others. A re-run on SXM5 would close some of the
-  gap but is unlikely to leapfrog AdamW.
+- **NorMuon lands last** even on the same SKU and comparable step count
+  (81 vs 77-86 for the others). The gap is the optimizer, not the
+  hardware — its normalized momentum may need different beta2/eps for
+  this scale, but that's a tuning ablation for a follow-up.
 - A naive Muon run at `muon_lr=2e-5` (same as AdamW) scored only
   **+0.389** — the per-group LR convention matters; without it Muon
   underutilizes its update budget.

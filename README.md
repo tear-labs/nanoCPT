@@ -28,7 +28,7 @@ Higher is better. The current Track 2 record is **+0.497**.
 | 1 | **+0.4972** | Full FT, AdamW fused, lr 2e-5, mb 1 × ga 8, seed 1337, flex-attention, max-autotune-no-cudagraphs | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_adamw_fused_full-FT_seed1337/summary.json) | @levstamb |
 | 2 | +0.4868 | Full FT, Muon8 hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_muon8_hybrid_full-FT_seed1337/summary.json) | @levstamb |
 | 3 | +0.4862 | Full FT, Muon hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_muon_hybrid_full-FT_seed1337/summary.json) | @levstamb |
-| 4 | +0.4570 | Full FT, NorMuon hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 — ran on H100 NVL (slower per step) | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_normuon_hybrid_full-FT_seed1337/summary.json) | @levstamb |
+| 4 | +0.4612 | Full FT, NorMuon hybrid (muon-lr 2e-4, adamw-tail-lr 2e-5), seed 1337 | 2026-05-28 | [summary](records/track_2_5min/2026-05-28_Track2_normuon_hybrid_full-FT_seed1337/summary.json) | @levstamb |
 
 ### Track 3 — 2 hours
 

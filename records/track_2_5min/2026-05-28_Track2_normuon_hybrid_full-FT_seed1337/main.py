@@ -458,7 +458,7 @@ def run_track1(
     requested_lr = lr
     requested_weight_decay = weight_decay
     requested_optimizer_name = optimizer_name
-    resolved_optimizer_name = "adamw8bit" if optimizer_name == "auto" else optimizer_name
+    resolved_optimizer_name = "adamw_fused" if optimizer_name == "auto" else optimizer_name
     wandb_tags_list = [tag.strip() for tag in wandb_tags.split(",") if tag.strip()]
     wandb_enabled = bool(wandb_project) and wandb_mode != "disabled"
     if lr <= 0.0:

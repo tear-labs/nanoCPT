@@ -6,15 +6,15 @@ Data mode: cpt
 Loss mask: all_tokens
 Sequence packing: True (stream_concat_no_padding)
 Minutes: 5.0
-Eval loss drop: 0.456997
+Eval loss drop: 0.461228
 Baseline eval loss: 0.854382
-Final eval loss: 0.397384
-Steps: 65
-Tokens: 2,129,920
-Supervised tokens: 2,129,400
+Final eval loss: 0.393154
+Steps: 81
+Tokens: 2,654,208
+Supervised tokens: 2,653,560
 Eval supervised tokens: 262,144
-Compile + warmup (untimed): 233.7s
-Elapsed budget: 301.9s
-Budget tokens/sec: 7054
-Train-loop elapsed: 301.9s
-Train-loop tokens/sec: 7054
+Compile + warmup (untimed): 244.3s
+Elapsed budget: 300.4s
+Budget tokens/sec: 8836
+Train-loop elapsed: 300.4s
+Train-loop tokens/sec: 8836
