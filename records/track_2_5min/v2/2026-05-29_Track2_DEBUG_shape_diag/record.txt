@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 DEBUG shape diag
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.646055
+Baseline eval loss: 1.015397
+Final eval loss: 0.369342
+Steps: 69
+Tokens: 2,260,992
+Supervised tokens: 2,242,455
+Eval supervised tokens: 260,165
+Compile + warmup (untimed): 311.5s
+Elapsed budget: 303.6s
+Budget tokens/sec: 7448
+Train-loop elapsed: 303.6s
+Train-loop tokens/sec: 7448

@@ -346,8 +346,7 @@ def run_track1(
     lowpass_chunk_size: int = DEFAULT_LOWPASS_CHUNK_SIZE,
     lowpass_keep: int = DEFAULT_LOWPASS_KEEP,
     lowpass_target_filter: Literal["mlp", "all", "none"] = DEFAULT_LOWPASS_TARGET_FILTER,
-    lowpass_min_hidden_dim: int = 8000,
-    lowpass_max_hidden_dim: int = 16000,
+    lowpass_min_hidden_dim: int = 8192,
     lowpass_hadamard_backend: Literal["auto", "piecewise", "dense"] = "auto",
     lr_schedule: Literal["constant", "linear", "cosine", "wsd"] = "constant",
     lr_decay_fraction: float = 0.1,
@@ -659,7 +658,6 @@ def run_track1(
         "lowpass_chunk_size": lowpass_chunk_size,
         "lowpass_keep": lowpass_keep,
         "lowpass_min_hidden_dim": lowpass_min_hidden_dim,
-        "lowpass_max_hidden_dim": lowpass_max_hidden_dim,
         "lowpass_hadamard_backend": lowpass_hadamard_backend,
         "eval_version": EVAL_VERSION,
         "pack_align": pack_align,
@@ -1085,14 +1083,12 @@ def run_track1(
             chunk_size=lowpass_chunk_size,
             keep=lowpass_keep,
             min_hidden_dim=lowpass_min_hidden_dim,
-            max_hidden_dim=lowpass_max_hidden_dim,
             hadamard_backend=lowpass_hadamard_backend,
         )
         print(
             f"lowpass: model-wide saved_tensors_hooks active "
             f"(chunk={lowpass_chunk_size}, keep={lowpass_keep}, "
-            f"hidden_dim∈[{lowpass_min_hidden_dim}, "
-            f"{lowpass_max_hidden_dim if lowpass_max_hidden_dim > 0 else '∞'}], "
+            f"min_hidden_dim={lowpass_min_hidden_dim}, "
             f"projector={lowpass_projector_kind}, backend={lowpass_hadamard_backend})",
             flush=True,
         )
@@ -1825,8 +1821,7 @@ def main(
     lowpass_chunk_size: int = DEFAULT_LOWPASS_CHUNK_SIZE,
     lowpass_keep: int = DEFAULT_LOWPASS_KEEP,
     lowpass_target_filter: str = DEFAULT_LOWPASS_TARGET_FILTER,
-    lowpass_min_hidden_dim: int = 8000,
-    lowpass_max_hidden_dim: int = 16000,
+    lowpass_min_hidden_dim: int = 8192,
     lowpass_hadamard_backend: str = "auto",
     lr_schedule: str = "constant",
     lr_decay_fraction: float = 0.1,
@@ -1896,7 +1891,6 @@ def main(
         lowpass_keep=lowpass_keep,
         lowpass_target_filter=lowpass_target_filter,  # type: ignore[arg-type]
         lowpass_min_hidden_dim=lowpass_min_hidden_dim,
-        lowpass_max_hidden_dim=lowpass_max_hidden_dim,
         lowpass_hadamard_backend=lowpass_hadamard_backend,  # type: ignore[arg-type]
         lr_schedule=lr_schedule,  # type: ignore[arg-type]
         lr_decay_fraction=lr_decay_fraction,

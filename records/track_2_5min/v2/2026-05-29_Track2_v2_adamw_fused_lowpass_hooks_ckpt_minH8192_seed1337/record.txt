@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 v2 adamw_fused lowpass hooks ckpt minH8192 seed1337
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: -5.461441
+Baseline eval loss: 1.015397
+Final eval loss: 6.476837
+Steps: 93
+Tokens: 3,047,424
+Supervised tokens: 3,022,298
+Eval supervised tokens: 260,165
+Compile + warmup (untimed): 223.8s
+Elapsed budget: 302.3s
+Budget tokens/sec: 10081
+Train-loop elapsed: 302.3s
+Train-loop tokens/sec: 10081

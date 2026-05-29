@@ -340,6 +340,81 @@ because we get 60 % as many optimizer steps.
    forward pass at seq=4096 is ~40 GiB on its own, and a 50 %
    compression on MLP only saves a few GiB.
 
+### Refactor: model-wide `saved_tensors_hooks`
+
+Per-Linear wrapping turned out to be the wrong abstraction. The
+`nanoCPT-hadamard-lowpass` worktree (which achieved +13% throughput at
+LoRA scale) installs a single `torch.autograd.graph.saved_tensors_hooks`
+context around the training step. Every `save_for_backward` call across
+the model is intercepted by a pack/unpack pair — no custom autograd
+Function, no graph break, fully compatible with `torch.compile`.
+
+The refactored `lowpass.py` ships this pattern: `activation_save_context(config, seq_len)` returns the hooks context; the train and warmup loops wrap their forward+backward block with it. `pack(tensor)` filters by ndim, hidden-dim range, and sequence-axis match, then Hadamard-projects chunks and stores the compressed tuple. `unpack(packed)` inverse-projects on demand. Default filter is `8000 ≤ hidden_dim ≤ 16000` to target the MLP intermediate (Qwen3.5-4B `intermediate_size = 9216`) and skip the residual stream (`hidden_size = 2560`) and the lm_head output (`vocab_size = 248320`).
+
+### What the hooks actually catch
+
+Diagnostic prints (set `LOWPASS_LOG_SHAPES=N` for first-N-unique
+logging) show:
+
+- With gradient checkpointing **ON** (default): the only saved tensor
+  the hook sees is `(batch, seq, hidden_size)` — the block input that
+  `torch.utils.checkpoint` stores for later recompute. The MLP
+  intermediate, attention K/V, and other inside-block tensors are saved
+  during *recompute*, in a context the outer hook does not capture.
+- With gradient checkpointing **OFF**: the hook sees the MLP
+  intermediate `(batch, seq, 9216)`, the lm_head output
+  `(batch, seq, 248320)`, and attention shapes. Filtering to the
+  `[8000, 16000]` window isolates just the MLP intermediate.
+
+### The two regimes neither work at 4B full FT
+
+| Regime | Compresses | Memory effect | Quality |
+|---|---|---:|---|
+| ckpt on, hidden 8000-16000 | nothing (block I/O is 2560) | none — pure overhead | trains fine |
+| ckpt on, hidden ≥ 64 | block I/O (residual stream) | ~3-5 GiB saved | diverges (keep=32, 48, 60); only keep=64 (lossless) trains |
+| ckpt off, hidden 8000-16000 | MLP intermediate | would save ~10 GiB | OOM before first step |
+
+The ckpt-off OOM is the killer. At 4B full FT with adamw8bit (~8 GiB
+opt state), model (8 GiB), grads (8 GiB), and uncompressed activations
+across all 36 blocks (~50+ GiB), no-checkpointing simply doesn't fit
+on 80 GiB H100 even with MLP-intermediate compression. The
+`nanoCPT-hadamard-lowpass` worktree got their +13 % at **LoRA**
+scale where opt state and grad memory are tiny (~50 MB instead of 16
+GiB), leaving plenty of room for full activation residency.
+
+### Throughput numbers at the regimes we could measure
+
+| Run | tokens/s | Steps | Notes |
+|---|---:|---:|---|
+| v2 baseline (no lowpass, ckpt on) | 11,161 | 103 | reference |
+| Per-Linear lowpass (autograd Fn) | 6,881 | 63 | 38 % slowdown from graph breaks |
+| Per-Linear + `compiler.disable` | 6,368 | 59 | swap fragmentation for guard overhead |
+| Hooks, keep=64 (lossless, no compression) | 7,720 | 71 | proves hook plumbing is sound |
+| Hooks, keep=32 (full compression) | 9,743 | 90 | **fast** but loss diverges (model collapses) |
+| Hooks, keep=32 + 8000-16000 filter, ckpt off | — | — | OOM at warmup (insufficient memory savings) |
+
+### Verdict
+
+The `--lowpass` code path is correct and the hooks installation matches
+the canonical 2026 pattern. At our specific regime (4B full FT, single
+80 GiB H100, default ckpt), it cannot reduce peak memory in a way that
+either preserves quality or enables a larger batch / seq. The win
+demonstrated at LoRA scale doesn't transfer.
+
+Three avenues that *could* unlock it for full FT:
+- **Block-aware compression**: install pack/unpack hooks *inside* the
+  per-block checkpoint recompute, not just at the outer boundary. Would
+  need to patch `torch.utils.checkpoint` or HF's block wrappers.
+- **Activation int8 quantization** (instead of frequency dropping) on
+  block I/O — quantization noise is lower-bias than low-pass, so might
+  preserve quality at the residual stream.
+- **FSDP / sequence parallelism** to free the optimizer / activation
+  memory enough that no-checkpoint becomes viable, which is where MLP
+  intermediate compression actually pays.
+
+v2 Track 2 leaderboard #1 remains the doc-aware adamw_fused baseline
+at **+0.6730**.
+
 ### Attempt: `@torch.compiler.disable` workaround
 
 To test whether the slowdown was purely from graph fragmentation, the

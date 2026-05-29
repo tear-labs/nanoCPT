@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 v2 adamw_fused lowpass keep64 NO_COMPRESS seed1337
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.648243
+Baseline eval loss: 1.015397
+Final eval loss: 0.367153
+Steps: 71
+Tokens: 2,326,528
+Supervised tokens: 2,307,403
+Eval supervised tokens: 260,165
+Compile + warmup (untimed): 267.1s
+Elapsed budget: 301.3s
+Budget tokens/sec: 7720
+Train-loop elapsed: 301.3s
+Train-loop tokens/sec: 7720
