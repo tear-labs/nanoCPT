@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 docaware adamw_fused mb8 ga1 max95VRAM rebaseline seed1337
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.676607
+Baseline eval loss: 1.021390
+Final eval loss: 0.344783
+Steps: 117
+Tokens: 3,833,856
+Supervised tokens: 3,832,920
+Eval supervised tokens: 262,144
+Compile + warmup (untimed): 234.6s
+Elapsed budget: 302.1s
+Budget tokens/sec: 12690
+Train-loop elapsed: 302.1s
+Train-loop tokens/sec: 12690
