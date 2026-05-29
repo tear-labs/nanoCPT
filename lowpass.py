@@ -402,3 +402,173 @@ def activation_save_context(config: LowpassConfig, seq_len: int):
         return contextlib.nullcontext()
     pack, unpack = _make_pack_unpack(config, seq_len)
     return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
+
+
+# ---------------------------------------------------------------------------
+# Per-Linear patching path: replaces every nn.Linear with LowpassLinear so the
+# autograd Function saves a Hadamard-projected input instead of the raw input.
+# Catches MLP intermediates and attention Q/K/V/O inputs that don't appear in
+# the model-wide `saved_tensors_hooks` view (e.g. when the MLP uses a fused
+# kernel that bypasses the global save_for_backward path).
+# ---------------------------------------------------------------------------
+
+
+class _LowpassLinearFunction(torch.autograd.Function):
+    """`F.linear` with Hadamard-projected `x_hat` saved instead of `x`.
+
+    Forward: exact `y = F.linear(x, w, b)`.
+    Backward:
+      grad_x = grad_output @ weight                    (exact)
+      grad_w = go_hat.T @ x_hat                        (approximate)
+      grad_b = grad_output.sum(reduce_dims)            (exact)
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, projector_kind, chunk_size, keep, hadamard_backend):
+        y = F.linear(x, weight, bias)
+        ctx.input_shape = tuple(x.shape)
+        ctx.input_dtype = x.dtype
+        ctx.weight_dtype = weight.dtype
+        ctx.has_bias = bias is not None
+        ctx.projector_kind = str(projector_kind)
+        ctx.chunk_size = int(chunk_size)
+        ctx.keep = int(keep)
+        ctx.hadamard_backend = str(hadamard_backend)
+        x_hat = _chunk_and_project(
+            x, ctx.projector_kind, ctx.chunk_size, ctx.keep, ctx.hadamard_backend
+        )
+        ctx.save_for_backward(x_hat.contiguous(), weight)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_hat, weight = ctx.saved_tensors
+        work_dtype = weight.dtype if weight.is_floating_point() else grad_output.dtype
+        go = grad_output.to(work_dtype)
+        grad_x = grad_weight = grad_bias = None
+
+        if ctx.needs_input_grad[0]:
+            grad_x = go.matmul(weight.to(work_dtype)).to(ctx.input_dtype)
+
+        if ctx.needs_input_grad[1]:
+            go_hat = _chunk_and_project(
+                grad_output, ctx.projector_kind, ctx.chunk_size, ctx.keep, ctx.hadamard_backend
+            ).to(work_dtype)
+            x_work = x_hat.to(work_dtype)
+            grad_weight = go_hat.reshape(-1, go_hat.shape[-1]).T.matmul(
+                x_work.reshape(-1, x_work.shape[-1])
+            ).to(ctx.weight_dtype)
+
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            reduce_dims = tuple(range(grad_output.ndim - 1))
+            grad_bias = grad_output.sum(dim=reduce_dims)
+
+        return grad_x, grad_weight, grad_bias, None, None, None, None
+
+
+def _chunk_and_project(
+    x: Tensor,
+    projector_kind: str,
+    chunk_size: int,
+    keep: int,
+    hadamard_backend: str,
+) -> Tensor:
+    """Reshape x → [n_chunks, chunk_size, hidden] and Hadamard-project to keep."""
+    if x.ndim == 2:
+        x = x.unsqueeze(0)
+    # x is now at least 3D. Flatten leading dims, treat dim -2 as token axis.
+    token_count = int(x.shape[-2])
+    hidden = int(x.shape[-1])
+    leading = int(x.numel()) // (token_count * hidden)
+    n_chunks = token_count // chunk_size
+    chunks = x.reshape(leading, n_chunks, chunk_size, hidden).reshape(
+        leading * n_chunks, chunk_size, hidden
+    ).contiguous()
+    return _project_chunks(chunks, projector_kind, keep, hadamard_backend).contiguous()
+
+
+class LowpassLinear(torch.nn.Module):
+    """Drop-in `nn.Linear` replacement that compresses saved activations."""
+
+    def __init__(self, linear: torch.nn.Linear, config: LowpassConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.weight = linear.weight
+        self.bias = linear.bias
+
+    @classmethod
+    def from_linear(cls, linear: torch.nn.Linear, config: LowpassConfig) -> "LowpassLinear":
+        return cls(linear, config)
+
+    def _can_use_lowpass(self, x: Tensor) -> bool:
+        if not self.config.enabled or not torch.is_grad_enabled():
+            return False
+        chunk_size = int(self.config.chunk_size)
+        min_hidden_dim = int(self.config.min_hidden_dim)
+        max_hidden_dim = int(self.config.max_hidden_dim)
+        token_count = int(x.shape[-2]) if x.ndim >= 2 else 0
+        hidden = int(x.shape[-1]) if x.ndim >= 1 else 0
+        if token_count < chunk_size or token_count % chunk_size != 0:
+            return False
+        if hidden < min_hidden_dim:
+            return False
+        if max_hidden_dim > 0 and hidden > max_hidden_dim:
+            return False
+        return self.weight.requires_grad
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not self._can_use_lowpass(x):
+            return F.linear(x, self.weight, self.bias)
+        return _LowpassLinearFunction.apply(
+            x,
+            self.weight,
+            self.bias,
+            self.config.projector_kind,
+            self.config.chunk_size,
+            self.config.keep,
+            self.config.hadamard_backend,
+        )
+
+
+_MLP_NAME_PARTS = ("mlp", "gate_proj", "up_proj", "down_proj", "feed_forward", "ffn")
+
+
+def mlp_module_filter(name: str, _module: torch.nn.Linear) -> bool:
+    lowered = name.lower()
+    return any(part in lowered for part in _MLP_NAME_PARTS)
+
+
+def make_module_filter(target: str) -> Callable[[str, torch.nn.Linear], bool] | None:
+    normalized = str(target).lower().replace("-", "_")
+    if normalized == "mlp":
+        return mlp_module_filter
+    if normalized in {"all", "every", "any"}:
+        return None  # None means replace every nn.Linear
+    if normalized in {"none", "off"}:
+        return lambda _name, _module: False
+    raise ValueError(f"unknown lowpass target filter {target!r}")
+
+
+def replace_linear_with_lowpass(
+    model: torch.nn.Module,
+    config: LowpassConfig,
+    module_filter: Callable[[str, torch.nn.Linear], bool] | None = None,
+) -> list[str]:
+    replaced: list[str] = []
+
+    def visit(parent: torch.nn.Module, prefix: str) -> None:
+        for child_name, child in list(parent.named_children()):
+            full_name = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child, LowpassLinear):
+                continue
+            if isinstance(child, torch.nn.Linear):
+                if module_filter is None or module_filter(full_name, child):
+                    setattr(parent, child_name, LowpassLinear.from_linear(child, config))
+                    replaced.append(full_name)
+                continue
+            visit(child, full_name)
+
+    visit(model, "")
+    return replaced

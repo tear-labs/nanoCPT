@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 v2 adamw_fused lowpass perLinear MLP keep32 reentFalse v2 seed1337
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: -8.344041
+Baseline eval loss: 1.015397
+Final eval loss: 9.359438
+Steps: 76
+Tokens: 2,490,368
+Supervised tokens: 2,469,884
+Eval supervised tokens: 260,165
+Compile + warmup (untimed): 225.0s
+Elapsed budget: 300.3s
+Budget tokens/sec: 8292
+Train-loop elapsed: 300.3s
+Train-loop tokens/sec: 8292
