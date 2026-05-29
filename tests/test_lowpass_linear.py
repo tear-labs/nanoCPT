@@ -1,4 +1,4 @@
-"""Unit tests for the Hadamard low-pass `nn.Linear` replacement.
+"""Unit tests for INSTANT-faithful low-pass `nn.Linear` replacement.
 
 Run locally (`uv run python -m unittest tests.test_lowpass_linear -v`) if
 torch is installed. Otherwise the tests skip; the Modal smoke run is the
@@ -20,7 +20,7 @@ try:
         mlp_module_filter,
         replace_linear_with_lowpass,
     )
-except ImportError as exc:  # pragma: no cover - exercised when torch is absent.
+except ImportError as exc:  # pragma: no cover
     _IMPORT_ERROR: Exception | None = exc
 else:
     _IMPORT_ERROR = None
@@ -44,9 +44,11 @@ def _make_linear_and_lowpass(in_features: int, out_features: int, config: Lowpas
 
 
 class ForwardParityTest(unittest.TestCase):
+    """Forward is exact in INSTANT: y = F.linear(x, w, b) regardless of projector."""
+
     @_skip_if_no_torch
     def test_forward_matches_linear(self):
-        config = LowpassConfig(projector_kind="hadamard", keep=8, min_hidden_dim=0)
+        config = LowpassConfig(projector_kind="dct", max_rank=8, min_rank=4)
         baseline, lp = _make_linear_and_lowpass(256, 384, config)
         x = torch.randn(2, 128, 256, requires_grad=False)
         with torch.no_grad():
@@ -55,10 +57,17 @@ class ForwardParityTest(unittest.TestCase):
         self.assertTrue(torch.allclose(y_ref, y_lp, atol=1e-6, rtol=1e-6))
 
 
-class InputGradExactTest(unittest.TestCase):
+class ExactInputGradTest(unittest.TestCase):
+    """With exact_input_grad=True grad_x = grad_output @ weight exactly."""
+
     @_skip_if_no_torch
-    def test_input_grad_exact(self):
-        config = LowpassConfig(projector_kind="hadamard", keep=8, min_hidden_dim=0)
+    def test_input_grad_exact_when_flag_set(self):
+        config = LowpassConfig(
+            projector_kind="dct",
+            max_rank=8,
+            min_rank=4,
+            exact_input_grad=True,
+        )
         baseline, lp = _make_linear_and_lowpass(256, 384, config)
 
         x = torch.randn(2, 128, 256)
@@ -71,59 +80,15 @@ class InputGradExactTest(unittest.TestCase):
         y_lp.backward(grad_out)
         self.assertIsNotNone(x_ref.grad)
         self.assertIsNotNone(x_lp.grad)
-        # grad_x = grad_output @ weight is computed exactly in both paths.
         self.assertTrue(torch.allclose(x_ref.grad, x_lp.grad, atol=1e-5, rtol=1e-5))
-
-
-class ExactPathTest(unittest.TestCase):
-    """The autograd Function must short-circuit to exact `F.linear`
-    semantics for inputs that can't be cleanly projected — needed for
-    torch.compile shape stability."""
-
-    @_skip_if_no_torch
-    def test_2d_input_grad_matches_linear_exactly(self):
-        # 2D input [batch, hidden] triggers the exact short-circuit.
-        config = LowpassConfig(projector_kind="hadamard", keep=8, min_hidden_dim=0)
-        baseline, lp = _make_linear_and_lowpass(256, 384, config)
-        x_ref = torch.randn(16, 256, requires_grad=True)
-        x_lp = x_ref.detach().clone().requires_grad_(True)
-        y_ref = baseline(x_ref)
-        y_lp = lp(x_lp)
-        grad_out = torch.randn_like(y_ref)
-        y_ref.backward(grad_out)
-        y_lp.backward(grad_out)
-        # Both grad_x and grad_w should match exactly (within fp tolerance).
-        self.assertTrue(torch.allclose(x_ref.grad, x_lp.grad, atol=1e-5, rtol=1e-5))
-        self.assertTrue(
-            torch.allclose(baseline.weight.grad, lp.weight.grad, atol=1e-5, rtol=1e-5)
-        )
-
-    @_skip_if_no_torch
-    def test_seq_too_short_for_rank_falls_back_to_exact(self):
-        # 3D input but seq < keep: the projection would be ill-defined
-        # → must fall back to the exact path.
-        config = LowpassConfig(projector_kind="hadamard", keep=64, min_hidden_dim=0)
-        baseline, lp = _make_linear_and_lowpass(256, 384, config)
-        x = torch.randn(2, 4, 256, requires_grad=True)  # seq=4 < keep=64
-        x_ref = x.detach().clone().requires_grad_(True)
-        x_lp = x.detach().clone().requires_grad_(True)
-        y_ref = baseline(x_ref)
-        y_lp = lp(x_lp)
-        grad_out = torch.randn_like(y_ref)
-        y_ref.backward(grad_out)
-        y_lp.backward(grad_out)
-        self.assertTrue(torch.allclose(x_ref.grad, x_lp.grad, atol=1e-5, rtol=1e-5))
-        self.assertTrue(
-            torch.allclose(baseline.weight.grad, lp.weight.grad, atol=1e-5, rtol=1e-5)
-        )
 
 
 class ParamGradToleranceTest(unittest.TestCase):
+    """grad_w is approximate via projection; check RMS-rel error is bounded."""
+
     @_skip_if_no_torch
     def test_param_grad_within_tolerance(self):
-        # 32/64 keep ratio: param grad is approximate but should stay close to
-        # the exact gradient. We assert relative RMS error is bounded.
-        config = LowpassConfig(projector_kind="hadamard", keep=8, min_hidden_dim=0)
+        config = LowpassConfig(projector_kind="dct", max_rank=8, min_rank=4)
         baseline, lp = _make_linear_and_lowpass(256, 384, config)
 
         x = torch.randn(2, 128, 256, requires_grad=True)
@@ -139,21 +104,36 @@ class ParamGradToleranceTest(unittest.TestCase):
         y_lp.backward(grad_out)
         lp_grad_w = lp.weight.grad.clone()
 
-        # Param grads from low-pass projection should be approximate but
-        # well-correlated. With keep=chunk_size/2 we expect noticeable but
-        # bounded error — Adam's EMA smooths these out in training.
         rms_ref = ref_grad_w.pow(2).mean().sqrt()
         rms_err = (lp_grad_w - ref_grad_w).pow(2).mean().sqrt()
         rel_err = (rms_err / rms_ref).item()
-        # Generous bound: 50% RMS-relative — proves the gradient direction
-        # carries signal without asserting it's near-exact.
+        # rank 8 of seq 128 keeps 6.25% of basis; bound at 50% RMS-rel.
         self.assertLess(rel_err, 0.50, msg=f"param grad RMS-rel error {rel_err:.3f} > 0.50")
+
+
+class FallbackOn2DInputTest(unittest.TestCase):
+    """2D input has no seq axis → must fall back to exact F.linear semantics."""
+
+    @_skip_if_no_torch
+    def test_2d_input_grad_matches_linear_exactly(self):
+        config = LowpassConfig(projector_kind="dct", max_rank=8, min_rank=4)
+        baseline, lp = _make_linear_and_lowpass(256, 384, config)
+        x_ref = torch.randn(16, 256, requires_grad=True)
+        x_lp = x_ref.detach().clone().requires_grad_(True)
+        y_ref = baseline(x_ref)
+        y_lp = lp(x_lp)
+        grad_out = torch.randn_like(y_ref)
+        y_ref.backward(grad_out)
+        y_lp.backward(grad_out)
+        self.assertTrue(torch.allclose(x_ref.grad, x_lp.grad, atol=1e-5, rtol=1e-5))
+        self.assertTrue(
+            torch.allclose(baseline.weight.grad, lp.weight.grad, atol=1e-5, rtol=1e-5)
+        )
 
 
 class ReplaceWalkerTest(unittest.TestCase):
     @_skip_if_no_torch
     def test_replace_walks_model_mlp_filter(self):
-        # Tiny mock of a transformer-ish layer with named MLP sub-linears.
         class TinyMLP(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -183,14 +163,12 @@ class ReplaceWalkerTest(unittest.TestCase):
             def forward(self, x):
                 return self.mlp(x) + self.attn(x)
 
-        config = LowpassConfig(projector_kind="dct", keep=8, min_hidden_dim=0)
+        config = LowpassConfig(projector_kind="dct", max_rank=8, min_rank=4)
         model = TinyBlock()
         replaced = replace_linear_with_lowpass(model, config, mlp_module_filter)
-        # Should hit gate_proj/up_proj/down_proj (3 MLP linears), not Q/K/V.
         self.assertEqual(len(replaced), 3)
         for name in replaced:
             self.assertTrue("mlp" in name)
-        # Verify attn Linears are untouched.
         self.assertIsInstance(model.attn.q_proj, nn.Linear)
         self.assertNotIsInstance(model.attn.q_proj, LowpassLinear)
         self.assertIsInstance(model.mlp.gate_proj, LowpassLinear)

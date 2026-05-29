@@ -77,6 +77,56 @@ baseline eval, and `torch.compile` + train-shaped warmup. Those run as an
 after the timed train loop. The untimed compile/warmup duration is recorded
 as `elapsed_compile_warmup_seconds` in `summary.json`.
 
+## Held-out generalization eval (diagnostic)
+
+The default eval set is sliced from the leading documents of the **same**
+training corpus, so it shares the conlang's small lexicon and topic seeds. The
+`eval_loss_drop` it reports therefore measures *distribution-fitting* — and on
+the current corpus it saturates within ~5 minutes. To measure *generalization*
+to unseen text, point the eval at a separate corpus generated from the **same
+grammar** but a different seed and disjoint topics:
+
+```bash
+# 0. (Optional) regenerate the train corpus — typos are ON by default (2%):
+uv run python scripts/synthesize_conlang_cpt.py --language-id bd412d52
+
+# 1. Generate a held-out corpus (same grammar, disjoint topics; typos are
+#    force-disabled for --topic-set heldout so the eval stays clean):
+uv run python scripts/synthesize_conlang_cpt.py \
+  --language-id bd412d52 --topic-set heldout --variant heldout --seed 4099
+uv run python scripts/push_conlang_dataset.py \
+  data/conlang_cpt/bd412d52_heldout --repo-suffix heldout
+
+# 2. Run with the held-out eval (pin the revision printed by the push step):
+./run.sh track2 \
+  --heldout-eval-dataset-id TearedModels/conlangcrafter-cpt-bd412d52-heldout \
+  --heldout-eval-dataset-revision <rev>
+```
+
+When active, training reads the **full** train corpus (no doc skipping) and the
+summary records `eval_mode: heldout`. Each run also reports two reference
+signals: `ngram_reference_loss` (an in-sample token-bigram cross-entropy — a low
+value means the corpus is trivially compressible by local statistics) and, with
+`--eval-random-baseline`, `random_init_eval_loss` (a same-architecture random
+model). **Held-out numbers are not comparable to the in-distribution
+leaderboard** — report them separately.
+
+### Making the task harder
+
+The default train corpus is **deliberately noised**: `scripts/synthesize_conlang_cpt.py`
+applies `--typo-rate 0.02` (2% character-level typos: delete/duplicate/substitute/
+transpose, drawn from the conlang's own script) by default. This breaks rote
+memorization of the small repetitive lexicon and raises the loss floor, slowing
+the ~5-minute saturation. Pass `--typo-rate 0` to disable. The held-out eval
+corpus is always kept clean (typos are force-disabled for `--topic-set heldout`),
+so the generalization metric measures the language, not noise tolerance. Note
+that typos add some *irreducible* entropy, so part of the added difficulty is
+noise rather than deeper structure — 2% is a deliberately modest rate.
+
+Further knobs for a less compressible corpus: `--latin-script` (avoids the IPA
+sub-character tokenization that depresses the baseline), `--min-lexicon-words N`
+(larger lexicon), and a bigger `--target-tokens` budget.
+
 ## Quick start
 
 ```bash
@@ -105,10 +155,12 @@ with that directory and update the leaderboard table above.
 1. **Fixed inputs.** Don't change the model checkpoint, the dataset, or
    their pinned revisions (see Fixed inputs below). Don't swap to a
    different base model.
-2. **Don't touch the eval pipeline.** The eval set is the first
+2. **Don't touch the eval pipeline.** By default the eval set is the first
    `eval_blocks × seq_len` tokens of the unshuffled train stream. You may
    change `eval_blocks`, `seq_len`, or eval batch size, but not the
-   underlying tokens.
+   underlying tokens. (The optional held-out generalization eval below points
+   the eval set at a separate corpus; runs using it are reported in a separate,
+   non-comparable section since the metric measures a different thing.)
 3. **No reward hacking.** Changes designed to exploit dataset quirks,
    memorized ordering, eval-set leakage, or other source-specific shortcuts
    don't qualify. Future validation may run submissions against multiple

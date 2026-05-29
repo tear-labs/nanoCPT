@@ -210,7 +210,14 @@ strictly worse for this challenge.
    fits the lexical inventory. Future iterations should either pick a less
    compressible conlang spec (Latin-script alternatives in the
    `malper/ConlangCrafter` set may have higher baselines) or move to a
-   larger corpus to delay saturation.
+   larger corpus to delay saturation. The generator now supports these knobs
+   directly: `--latin-script`, `--min-lexicon-words N`, a larger
+   `--target-tokens`, and `--typo-rate` (character-level noise on the train
+   corpus that breaks rote memorization and raises the loss floor — note it
+   adds irreducible entropy, so use a modest rate ~1-3%). **`--typo-rate`
+   now defaults to 0.02**: the canonical train corpus is generated with 2%
+   typos, while the held-out eval corpus is always kept clean (typos are
+   force-disabled for `--topic-set heldout`).
 
 ## Caveats
 
@@ -221,10 +228,19 @@ strictly worse for this challenge.
   tokenization artifact (sub-character IPA pieces). A different base model
   with a different tokenizer would likely show different baseline numbers
   but the same general "drop is much larger than ultrachat" story.
-- **Eval set construction.** The held-out eval blocks are drawn from the
+- **Eval set construction.** By default the eval blocks are drawn from the
   unshuffled stream's leading documents (same as the legacy FineMath path),
-  so eval is from the same chunk distribution as training. For a cleaner
-  evaluation, generate a separate held-out set with a different seed.
+  so eval is from the same chunk distribution as training — the reported
+  `eval_loss_drop` measures distribution-fitting, not generalization, which is
+  why it saturates in ~5 min. A separate held-out generalization eval now
+  exists: generate a corpus from the same grammar with disjoint topics
+  (`scripts/synthesize_conlang_cpt.py --topic-set heldout --variant heldout
+  --seed <s>`), push it (`--repo-suffix heldout`), and pass
+  `--heldout-eval-dataset-id <repo> --heldout-eval-dataset-revision <rev>`.
+  Runs then report `eval_mode: heldout` plus `ngram_reference_loss` and
+  (optionally) `random_init_eval_loss` for context. See the README "Held-out
+  generalization eval" section. These numbers are NOT comparable to the
+  in-distribution leaderboard.
 - **One specific language (`bd412d52`).** Different ConlangCrafter languages
   would give different baseline/drop numbers. We picked the longest-spec
   DeepSeek-R1 language; nothing about the choice was optimized for "easiest

@@ -1,54 +1,226 @@
-"""Whole-sequence low-pass activation compression for `nn.Linear`.
+"""Per-Linear activation+gradient compression, port of INSTANT (Doan et al, ICLR 2026).
 
-Ported from `/home/lev/hermes-home/Research/AdaptiveRoundingSimp-qad-clean`'s
-`instant.py` reference design. Each wrapped `nn.Linear` saves a
-sequence-axis-projected `x_hat = projector @ x` for backward (shape
-`[..., keep, hidden]` instead of `[..., seq, hidden]`), giving
-seq_len/keep× memory savings on the saved activation.
+Mirrors `/home/lev/hermes-home/Research/AdaptiveRoundingSimp-qad-clean/packages/optimizers/src/optimizers/instant.py`.
+
+Each wrapped `nn.Linear` saves a sequence-axis-projected
+`x_hat = P @ x` (shape `[..., rank_a, hidden]`) for backward
+instead of the full `[..., seq, hidden]` activation. By default the
+projector `P` (and a separate gradient-side projector `Q`) are built
+from a per-layer SVD of activation/gradient samples collected during a
+short calibration phase. With `projector_kind="dct"` the SVD path is
+swapped for a fixed DCT basis — calibration then only reports captured
+energy rather than building a data-dependent basis.
 
 Backward:
-- `grad_x = grad_output @ weight` is **exact** (projecting it hurt
-  convergence in the AdaptiveRoundingSimp experiments).
-- `grad_w = einsum("nro,nri->oi", go_hat, x_hat)` is computed in the
-  projected space using `go_hat = projector @ grad_output`. This is a
-  low-rank approximation, accurate when the activation and grad signals
-  along the sequence axis lie close to the projector's row space.
+- `grad_w = einsum("nro,nri->oi", Q @ grad_output, P @ x)` — both sides
+  projected.
+- `grad_x = Q^T @ ((Q @ grad_output) @ weight)` when
+  `exact_input_grad=False` (the paper's mode). With
+  `exact_input_grad=True` we recover the exact `grad_x = grad_output @ weight`
+  at the cost of a separate full-rank matmul.
 
-Supported projectors: `dct`, `hadamard`, `haar` (the latter two require
-a power-of-two sequence length).
+Calibration: install forward + grad hooks on every `LowpassLinear`,
+run `steps` batches with `_calibrating=True` (which disables the
+compressed path during calibration), collect per-layer
+activation/gradient samples, SVD each pair, and write the rank +
+projectors back into the modules. See `calibrate_lowpass`.
+
+The paper does NOT compose with gradient checkpointing — activation
+compression is presented as an alternative to ckpt. We follow that
+convention: don't stack the two when measuring.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 
-_PROJECTOR_CACHE: dict[tuple[str, int, int, str, int, str], Tensor] = {}
+_FIXED_PROJECTOR_CACHE: dict[tuple[str, int, int, str, int, str], Tensor] = {}
 
 
 @dataclass(frozen=True)
 class LowpassConfig:
-    projector_kind: str = "dct"
-    keep: int = 8
-    min_hidden_dim: int = 8000
-    max_hidden_dim: int = 16000
+    """All knobs follow `InstantConfig` in the reference impl."""
+
+    max_seq_len: int = 4096
+    activation_energy: float = 0.95
+    gradient_energy: float = 0.95
+    min_rank: int = 4
+    max_rank: int = 64
+    max_rank_policy: str = "fixed"
+    max_rank_scale: float = 1.0
+    max_rank_absolute_cap: int | None = None
+    projector_kind: str = "svd"
+    oversample: int = 8
+    power_iterations: int = 2
+    calibration_max_columns: int = 2048
+    store_calibration_on_cpu: bool = True
+    exact_input_grad: bool = False
+    compress_gradients: bool = True
     enabled: bool = True
 
     def __post_init__(self) -> None:
-        projector_kind = str(self.projector_kind).lower()
-        object.__setattr__(self, "projector_kind", projector_kind)
-        if projector_kind not in {"dct", "hadamard", "haar"}:
+        if self.max_rank_policy not in {"fixed", "log2", "log2_sq"}:
+            raise ValueError(f"unknown max_rank_policy {self.max_rank_policy!r}")
+        if self.projector_kind not in {"svd", "dct", "hadamard", "haar", "random"}:
             raise ValueError(f"unknown projector_kind {self.projector_kind!r}")
-        if self.keep < 1:
-            raise ValueError("keep must be >= 1")
-        if self.min_hidden_dim < 0:
-            raise ValueError("min_hidden_dim must be non-negative")
+        if self.min_rank < 1:
+            raise ValueError("min_rank must be >= 1")
+        if self.max_rank < 1:
+            raise ValueError("max_rank must be >= 1")
+        if self.max_rank_scale <= 0.0:
+            raise ValueError("max_rank_scale must be > 0")
+        if self.max_rank_absolute_cap is not None and self.max_rank_absolute_cap < self.min_rank:
+            raise ValueError("max_rank_absolute_cap must be >= min_rank")
+
+
+@dataclass(frozen=True)
+class LowpassStats:
+    module_name: str
+    activation_rank: int
+    gradient_rank: int
+    activation_effective_max_rank: int
+    gradient_effective_max_rank: int
+    activation_columns: int
+    gradient_columns: int
+    activation_selected_energy: float
+    activation_cap_energy: float
+    activation_sketch_energy: float
+    activation_rank90_total: int
+    activation_rank95_total: int
+    activation_rank98_total: int
+    activation_rank99_total: int
+    gradient_selected_energy: float
+    gradient_cap_energy: float
+    gradient_sketch_energy: float
+    gradient_rank90_total: int
+    gradient_rank95_total: int
+    gradient_rank98_total: int
+    gradient_rank99_total: int
+    fallback_calls: int
+
+
+@dataclass(frozen=True)
+class _ProjectorResult:
+    projector: Tensor
+    rank: int
+    effective_max_rank: int
+    selected_energy: float
+    cap_energy: float
+    sketch_energy: float
+    rank90_total: int
+    rank95_total: int
+    rank98_total: int
+    rank99_total: int
+
+
+def _sequence_sample_matrix(x: Tensor, seq_len: int) -> Tensor:
+    if x.ndim < 3:
+        raise ValueError(f"expected [..., seq, hidden], got shape {tuple(x.shape)}")
+    work = x.detach()
+    if work.shape[-2] > seq_len:
+        work = work[..., :seq_len, :]
+    elif work.shape[-2] < seq_len:
+        pad = seq_len - work.shape[-2]
+        work = F.pad(work, (0, 0, 0, pad))
+    work = work.float().movedim(-2, 0).contiguous()
+    return work.reshape(seq_len, -1)
+
+
+def _append_sample_columns(
+    chunks: list[Tensor],
+    current_columns: int,
+    sample: Tensor,
+    max_columns: int,
+    *,
+    store_on_cpu: bool,
+) -> int:
+    remaining = max_columns - current_columns
+    if remaining <= 0:
+        return current_columns
+    take = min(remaining, sample.shape[1])
+    if take < sample.shape[1]:
+        indices = torch.randperm(sample.shape[1], device=sample.device)[:take]
+        sample = sample.index_select(1, indices)
+    if store_on_cpu:
+        sample = sample.cpu()
+    chunks.append(sample.contiguous())
+    return current_columns + take
+
+
+def _rank_from_singular_values(
+    values: Tensor, energy_threshold: float, min_rank: int, max_rank: int
+) -> int:
+    if values.numel() == 0:
+        return 0
+    energy = values.float().square()
+    total = energy.sum()
+    if not bool(torch.isfinite(total)) or float(total) <= 0.0:
+        return min(max_rank, max(min_rank, 1), values.numel())
+    cumulative = torch.cumsum(energy, dim=0) / total
+    rank = int(
+        torch.searchsorted(cumulative, torch.tensor(energy_threshold, device=cumulative.device)).item()
+    ) + 1
+    rank = max(rank, min_rank)
+    rank = min(rank, max_rank, values.numel())
+    return rank
+
+
+def _energy_at_rank(cumulative_energy: Tensor, rank: int) -> float:
+    if cumulative_energy.numel() == 0 or rank <= 0:
+        return 0.0
+    index = min(rank, cumulative_energy.numel()) - 1
+    value = float(cumulative_energy[index].detach().cpu())
+    return min(max(value, 0.0), 1.0)
+
+
+def _rank_at_total_energy(cumulative_energy: Tensor, threshold: float) -> int:
+    if cumulative_energy.numel() == 0:
+        return 0
+    reached = cumulative_energy >= threshold
+    if not bool(reached.any().detach().cpu()):
+        return int(cumulative_energy.numel()) + 1
+    return int(torch.nonzero(reached, as_tuple=False)[0].item()) + 1
+
+
+def _torch_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "is_compiling"):
+        return bool(compiler.is_compiling())
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "is_compiling"):
+        return bool(dynamo.is_compiling())
+    return False
+
+
+def _effective_max_rank_for_dimension(projector_dim: int, limit: int, config: LowpassConfig) -> int:
+    if limit == 0:
+        return 0
+    if config.max_rank_policy == "fixed":
+        raw_rank = config.max_rank
+    else:
+        log2_dim = math.log2(max(int(projector_dim), 2))
+        if config.max_rank_policy == "log2":
+            raw_rank = math.ceil(config.max_rank_scale * log2_dim)
+        elif config.max_rank_policy == "log2_sq":
+            raw_rank = math.ceil(config.max_rank_scale * log2_dim * log2_dim)
+        else:
+            raise ValueError(f"unknown max_rank_policy {config.max_rank_policy!r}")
+    rank = max(config.min_rank, raw_rank)
+    if config.max_rank_absolute_cap is not None:
+        rank = min(rank, config.max_rank_absolute_cap)
+    return min(rank, limit)
+
+
+def _effective_max_rank(samples: Tensor, config: LowpassConfig) -> int:
+    return _effective_max_rank_for_dimension(int(samples.shape[0]), min(samples.shape), config)
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -68,12 +240,8 @@ def _hadamard_index_for_sequency(sequency: int, width: int) -> int:
     return _bit_reverse(gray, width)
 
 
-def _projector_cache_key(
-    kind: str,
-    seq_len: int,
-    rank: int,
-    device: torch.device,
-    dtype: torch.dtype,
+def _fixed_projector_cache_key(
+    kind: str, seq_len: int, rank: int, device: torch.device, dtype: torch.dtype
 ) -> tuple[str, int, int, str, int, str]:
     device_index = -1 if device.index is None else int(device.index)
     return kind, int(seq_len), int(rank), device.type, device_index, str(dtype)
@@ -134,12 +302,25 @@ def _haar_projector(seq_len: int, rank: int, device: torch.device, dtype: torch.
     return projector.to(dtype=dtype).contiguous()
 
 
-def _fixed_projector(kind: str, seq_len: int, rank: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+def _random_orthogonal_projector(
+    seq_len: int, rank: int, device: torch.device, dtype: torch.dtype
+) -> Tensor:
+    basis_rank = min(seq_len, max(rank, 64))
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(17_729 + int(seq_len) * 1_003)
+    matrix = torch.randn((seq_len, basis_rank), generator=generator, dtype=torch.float32)
+    q, _r = torch.linalg.qr(matrix, mode="reduced")
+    return q[:, :rank].T.to(device=device, dtype=dtype).contiguous()
+
+
+def _fixed_projector(
+    kind: str, seq_len: int, rank: int, device: torch.device, dtype: torch.dtype
+) -> Tensor:
     rank = min(max(int(rank), 0), int(seq_len))
     if rank <= 0:
         return torch.empty((0, seq_len), device=device, dtype=dtype)
-    key = _projector_cache_key(kind, seq_len, rank, device, dtype)
-    cached = _PROJECTOR_CACHE.get(key)
+    key = _fixed_projector_cache_key(kind, seq_len, rank, device, dtype)
+    cached = _FIXED_PROJECTOR_CACHE.get(key)
     if cached is not None:
         return cached
     if kind == "dct":
@@ -148,151 +329,335 @@ def _fixed_projector(kind: str, seq_len: int, rank: int, device: torch.device, d
         projector = _hadamard_projector(seq_len, rank, device, dtype)
     elif kind == "haar":
         projector = _haar_projector(seq_len, rank, device, dtype)
+    elif kind == "random":
+        projector = _random_orthogonal_projector(seq_len, rank, device, dtype)
     else:
         raise ValueError(f"unknown fixed projector kind {kind!r}")
-    _PROJECTOR_CACHE[key] = projector
+    _FIXED_PROJECTOR_CACHE[key] = projector
     return projector
 
 
+def _project_fixed_token_basis(kind: str, x: Tensor, rank: int) -> Tensor:
+    projector = _fixed_projector(kind, x.shape[-2], rank, x.device, x.dtype)
+    return torch.einsum("rl,...lc->...rc", projector, x)
+
+
+def _fixed_transform_projector(
+    samples: Tensor,
+    *,
+    energy_threshold: float,
+    config: LowpassConfig,
+    device: torch.device,
+) -> _ProjectorResult:
+    if samples.ndim != 2:
+        raise ValueError(f"samples must be rank-2, got shape {tuple(samples.shape)}")
+    limit = min(samples.shape)
+    if limit == 0:
+        raise ValueError("cannot build a lowpass projector from empty samples")
+    effective_max_rank = _effective_max_rank(samples, config)
+    work = samples.to(device=device, dtype=torch.float32, non_blocking=True)
+    total_energy = work.square().sum()
+    projector = _fixed_projector(
+        config.projector_kind, work.shape[0], effective_max_rank, device, torch.float32
+    )
+    coefficients = projector.matmul(work)
+    component_energy = coefficients.square().sum(dim=1)
+    # Fixed token bases are explicit rank sweeps: dct_r8 means keep the first
+    # eight basis rows in every layer. Calibration only reports captured energy.
+    rank = effective_max_rank
+    if bool(torch.isfinite(total_energy).detach().cpu()) and float(total_energy.detach().cpu()) > 0.0:
+        cumulative_total_energy = torch.cumsum(component_energy, dim=0) / total_energy
+    else:
+        cumulative_total_energy = torch.zeros_like(component_energy)
+    return _ProjectorResult(
+        projector=torch.empty((0, work.shape[0]), device=device, dtype=torch.float32),
+        rank=rank,
+        effective_max_rank=effective_max_rank,
+        selected_energy=_energy_at_rank(cumulative_total_energy, rank),
+        cap_energy=_energy_at_rank(cumulative_total_energy, effective_max_rank),
+        sketch_energy=_energy_at_rank(cumulative_total_energy, effective_max_rank),
+        rank90_total=_rank_at_total_energy(cumulative_total_energy, 0.90),
+        rank95_total=_rank_at_total_energy(cumulative_total_energy, 0.95),
+        rank98_total=_rank_at_total_energy(cumulative_total_energy, 0.98),
+        rank99_total=_rank_at_total_energy(cumulative_total_energy, 0.99),
+    )
+
+
+def _randomized_projector(
+    samples: Tensor,
+    *,
+    energy_threshold: float,
+    config: LowpassConfig,
+    device: torch.device,
+) -> _ProjectorResult:
+    if samples.ndim != 2:
+        raise ValueError(f"samples must be rank-2, got shape {tuple(samples.shape)}")
+    limit = min(samples.shape)
+    if limit == 0:
+        raise ValueError("cannot build a lowpass projector from empty samples")
+    effective_max_rank = _effective_max_rank(samples, config)
+    q = min(limit, effective_max_rank + max(0, config.oversample))
+    work = samples.to(device=device, dtype=torch.float32, non_blocking=True)
+    total_energy = work.square().sum()
+    # torch.svd_lowrank is PyTorch's randomized low-rank SVD; calibration should
+    # only estimate the top subspace.
+    u, s, _v = torch.svd_lowrank(work, q=q, niter=config.power_iterations)
+    rank = _rank_from_singular_values(s, energy_threshold, config.min_rank, effective_max_rank)
+    singular_energy = s.float().square()
+    if bool(torch.isfinite(total_energy).detach().cpu()) and float(total_energy.detach().cpu()) > 0.0:
+        cumulative_total_energy = torch.cumsum(singular_energy, dim=0) / total_energy
+    else:
+        cumulative_total_energy = torch.zeros_like(singular_energy)
+    projector = u[:, :rank].T.contiguous()
+    return _ProjectorResult(
+        projector=projector,
+        rank=rank,
+        effective_max_rank=effective_max_rank,
+        selected_energy=_energy_at_rank(cumulative_total_energy, rank),
+        cap_energy=_energy_at_rank(cumulative_total_energy, effective_max_rank),
+        sketch_energy=_energy_at_rank(cumulative_total_energy, q),
+        rank90_total=_rank_at_total_energy(cumulative_total_energy, 0.90),
+        rank95_total=_rank_at_total_energy(cumulative_total_energy, 0.95),
+        rank98_total=_rank_at_total_energy(cumulative_total_energy, 0.98),
+        rank99_total=_rank_at_total_energy(cumulative_total_energy, 0.99),
+    )
+
+
 class _LowpassLinearFunction(torch.autograd.Function):
-    """Whole-sequence low-rank projection (matches AdaptiveRoundingSimp `instant.py`).
-
-    The Function has two arms keyed by `ctx.mode`:
-
-    - **`exact`**: any call whose `x` can't be cleanly projected
-      (`x.ndim < 3`, seq_len not power-of-two for Hadamard/Haar, etc.)
-      falls back to standard `F.linear` semantics and saves `(x, weight)`
-      unmodified. Backward runs the exact `grad_x = go @ weight`,
-      `grad_w = go^T @ x` path. Required for `torch.compile`: every
-      call site must save a tensor of a stable shape; without this guard
-      the 2D/3D conditional inside the lowpass arm produced traces with
-      a leading-dim-1 saved tensor that inductor's `assert_size_stride`
-      rejected on recompile.
-    - **`lowpass`**: forward saves `x_hat = projector @ x` of shape
-      `[batch, keep, hidden]` (always 3D, batch is the real batch dim).
-      grad_x is exact; grad_w is the low-rank
-      `einsum("nro,nri->oi", go_hat, x_hat)` approximation.
-
-    The two-arm structure mirrors `instant.py:484-595`.
-    """
-
     @staticmethod
-    def forward(ctx, x, weight, bias, projector_kind, keep):
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        x: Tensor,
+        weight: Tensor,
+        bias: Tensor | None,
+        activation_projector: Tensor | None,
+        gradient_projector: Tensor | None,
+        activation_rank: int,
+        gradient_rank: int,
+        use_lowpass: bool,
+        exact_input_grad: bool,
+        compress_gradients: bool,
+        projector_kind: str,
+    ) -> Tensor:
+        needs_gradient_projector = compress_gradients
         y = F.linear(x, weight, bias)
+        use_fixed_projector = projector_kind != "svd"
+        if (
+            not use_lowpass
+            or x.ndim < 3
+            or activation_rank <= 0
+            or (needs_gradient_projector and gradient_rank <= 0)
+            or (
+                not use_fixed_projector
+                and (
+                    activation_projector is None
+                    or (needs_gradient_projector and gradient_projector is None)
+                    or x.shape[-2] != activation_projector.shape[1]
+                    or (needs_gradient_projector and x.shape[-2] != gradient_projector.shape[1])
+                )
+            )
+            or (projector_kind in {"hadamard", "haar"} and not _is_power_of_two(int(x.shape[-2])))
+        ):
+            ctx.mode = "exact"
+            ctx.has_bias = bias is not None
+            ctx.save_for_backward(x, weight)
+            return y
+
+        work_dtype = x.dtype
+        ctx.mode = "lowpass"
         ctx.input_dtype = x.dtype
         ctx.weight_dtype = weight.dtype
         ctx.has_bias = bias is not None
-        # Guard: short-circuit to the exact path for anything we can't
-        # cleanly project along a 3D `[batch, seq, hidden]` axis.
-        if x.ndim < 3 or x.shape[-2] < int(keep):
-            ctx.mode = "exact"
-            ctx.save_for_backward(x, weight)
-            return y
-        projector_kind = str(projector_kind)
-        keep = int(keep)
-        seq_len_actual = int(x.shape[-2])
-        if projector_kind in {"hadamard", "haar"} and not _is_power_of_two(seq_len_actual):
-            ctx.mode = "exact"
-            ctx.save_for_backward(x, weight)
-            return y
-        ctx.mode = "lowpass"
+        ctx.exact_input_grad = exact_input_grad or not compress_gradients
+        ctx.compress_gradients = compress_gradients
         ctx.projector_kind = projector_kind
-        ctx.keep = keep
-        projector = _fixed_projector(projector_kind, seq_len_actual, keep, x.device, x.dtype)
-        x_hat = torch.einsum("rl,...lc->...rc", projector, x)
-        ctx.save_for_backward(x_hat.contiguous(), weight)
+        ctx.activation_rank = int(min(activation_rank, x.shape[-2]))
+        ctx.gradient_rank = int(min(gradient_rank, x.shape[-2])) if gradient_rank > 0 else 0
+        p: Tensor | None = None
+        q: Tensor | None = None
+        if not use_fixed_projector:
+            p = activation_projector.to(device=x.device, dtype=work_dtype)
+            q = gradient_projector.to(device=x.device, dtype=work_dtype) if gradient_projector is not None else None
+        if use_fixed_projector:
+            x_hat = _project_fixed_token_basis(projector_kind, x.to(work_dtype), ctx.activation_rank)
+        else:
+            x_hat = torch.einsum("rl,...lc->...rc", p, x.to(work_dtype))
+        if compress_gradients and not use_fixed_projector:
+            ctx.save_for_backward(x_hat, weight, p, q)
+        else:
+            saved_tensors = (x_hat, weight) if use_fixed_projector else (x_hat, weight, p)
+            ctx.save_for_backward(*saved_tensors)
         return y
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor | None, ...]:  # type: ignore[override]
         if ctx.mode == "exact":
             x, weight = ctx.saved_tensors
-            work_dtype = weight.dtype if weight.is_floating_point() else grad_output.dtype
-            go = grad_output.to(work_dtype)
             grad_x = grad_weight = grad_bias = None
             if ctx.needs_input_grad[0]:
-                grad_x = go.matmul(weight.to(work_dtype)).to(ctx.input_dtype)
+                grad_x = grad_output.matmul(weight)
             if ctx.needs_input_grad[1]:
-                grad_weight = go.reshape(-1, go.shape[-1]).T.matmul(
-                    x.to(work_dtype).reshape(-1, x.shape[-1])
-                ).to(ctx.weight_dtype)
+                grad_weight = grad_output.reshape(-1, grad_output.shape[-1]).T.matmul(
+                    x.reshape(-1, x.shape[-1])
+                )
             if ctx.has_bias and ctx.needs_input_grad[2]:
                 reduce_dims = tuple(range(grad_output.ndim - 1))
                 grad_bias = grad_output.sum(dim=reduce_dims)
-            return grad_x, grad_weight, grad_bias, None, None
+            return grad_x, grad_weight, grad_bias, None, None, None, None, None, None, None, None
 
-        # lowpass arm — x_hat is known to be 3D [batch, keep, hidden].
-        x_hat, weight = ctx.saved_tensors
-        work_dtype = x_hat.dtype
+        use_fixed_projector = ctx.projector_kind != "svd"
+        if use_fixed_projector:
+            x_hat, weight = ctx.saved_tensors
+        elif ctx.compress_gradients:
+            x_hat, weight, p, q = ctx.saved_tensors
+        else:
+            x_hat, weight, p = ctx.saved_tensors
+        work_dtype = x_hat.dtype if use_fixed_projector else p.dtype
         go = grad_output.to(work_dtype)
         grad_x = grad_weight = grad_bias = None
 
-        if ctx.needs_input_grad[0]:
-            grad_x = go.matmul(weight.to(work_dtype)).to(ctx.input_dtype)
-
         if ctx.needs_input_grad[1]:
-            seq_len_actual = int(go.shape[-2])
-            projector = _fixed_projector(
-                ctx.projector_kind, seq_len_actual, ctx.keep, go.device, work_dtype
-            )
-            go_hat = torch.einsum("rl,...lo->...ro", projector, go)
+            if use_fixed_projector:
+                go_for_w = _project_fixed_token_basis(ctx.projector_kind, go, ctx.activation_rank)
+            else:
+                go_for_w = torch.einsum("rl,...lo->...ro", p, go)
             grad_weight = torch.einsum(
                 "nro,nri->oi",
-                go_hat.reshape(-1, go_hat.shape[-2], go_hat.shape[-1]),
+                go_for_w.reshape(-1, go_for_w.shape[-2], go_for_w.shape[-1]),
                 x_hat.reshape(-1, x_hat.shape[-2], x_hat.shape[-1]),
             ).to(ctx.weight_dtype)
+
+        if ctx.needs_input_grad[0]:
+            if ctx.exact_input_grad:
+                grad_x = go.matmul(weight.to(work_dtype)).to(ctx.input_dtype)
+            else:
+                if not ctx.compress_gradients:
+                    raise RuntimeError(
+                        "compressed input gradients require compress_gradients=True"
+                    )
+                if use_fixed_projector:
+                    go_hat = _project_fixed_token_basis(ctx.projector_kind, go, ctx.gradient_rank)
+                    q = _fixed_projector(
+                        ctx.projector_kind, go.shape[-2], ctx.gradient_rank, go.device, work_dtype
+                    )
+                else:
+                    go_hat = torch.einsum("rl,...lo->...ro", q, go)
+                gx_hat = go_hat.matmul(weight.to(work_dtype))
+                grad_x = torch.einsum("rl,...ri->...li", q, gx_hat).to(ctx.input_dtype)
 
         if ctx.has_bias and ctx.needs_input_grad[2]:
             reduce_dims = tuple(range(grad_output.ndim - 1))
             grad_bias = grad_output.sum(dim=reduce_dims)
 
-        return grad_x, grad_weight, grad_bias, None, None
+        return grad_x, grad_weight, grad_bias, None, None, None, None, None, None, None, None
 
 
 class LowpassLinear(torch.nn.Module):
-    """Drop-in `nn.Linear` replacement that compresses saved activations."""
+    """Drop-in `nn.Linear` replacement using INSTANT-style compression."""
 
-    def __init__(self, linear: torch.nn.Linear, config: LowpassConfig) -> None:
+    def __init__(self, linear: torch.nn.Linear, config: LowpassConfig | None = None) -> None:
         super().__init__()
-        self.config = config
+        self.config = config or LowpassConfig()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.weight = linear.weight
         self.bias = linear.bias
+        device = linear.weight.device
+        self.register_buffer("activation_projector", torch.empty(0, device=device), persistent=True)
+        self.register_buffer("gradient_projector", torch.empty(0, device=device), persistent=True)
+        self.register_buffer("fallback_calls", torch.zeros((), dtype=torch.long, device=device), persistent=False)
+        self.register_buffer("lowpass_calls", torch.zeros((), dtype=torch.long, device=device), persistent=False)
+        self._calibrating = False
+        self.activation_transform_rank = 0
+        self.gradient_transform_rank = 0
 
     @classmethod
-    def from_linear(cls, linear: torch.nn.Linear, config: LowpassConfig) -> "LowpassLinear":
+    def from_linear(cls, linear: torch.nn.Linear, config: LowpassConfig | None = None) -> "LowpassLinear":
         return cls(linear, config)
 
-    def _can_use_lowpass(self, x: Tensor) -> bool:
-        if not self.config.enabled or not torch.is_grad_enabled():
-            return False
-        keep = int(self.config.keep)
-        min_hidden_dim = int(self.config.min_hidden_dim)
-        max_hidden_dim = int(self.config.max_hidden_dim)
-        if x.ndim < 2:
-            return False
-        token_count = int(x.shape[-2])
-        hidden = int(x.shape[-1])
-        if token_count < keep:
-            return False
-        if self.config.projector_kind in {"hadamard", "haar"} and not _is_power_of_two(token_count):
-            return False
-        if hidden < min_hidden_dim:
-            return False
-        if max_hidden_dim > 0 and hidden > max_hidden_dim:
-            return False
-        return self.weight.requires_grad
+    @property
+    def has_projectors(self) -> bool:
+        if self.config.projector_kind != "svd":
+            return True
+        has_activation = self.activation_projector.ndim == 2
+        has_gradient = self.gradient_projector.ndim == 2
+        return has_activation and (has_gradient or not self.config.compress_gradients)
+
+    def set_projectors(
+        self, activation_projector: Tensor, gradient_projector: Tensor | None = None
+    ) -> None:
+        projector_dtype = self.weight.dtype if self.weight.is_floating_point() else torch.float32
+        self.activation_projector = activation_projector.detach().to(
+            device=self.weight.device,
+            dtype=projector_dtype,
+        ).contiguous()
+        if gradient_projector is None:
+            self.gradient_projector = torch.empty(0, device=self.weight.device)
+        else:
+            self.gradient_projector = gradient_projector.detach().to(
+                device=self.weight.device,
+                dtype=projector_dtype,
+            ).contiguous()
+        self.activation_transform_rank = int(activation_projector.shape[0])
+        self.gradient_transform_rank = 0 if gradient_projector is None else int(gradient_projector.shape[0])
+
+    def set_transform_ranks(self, activation_rank: int, gradient_rank: int = 0) -> None:
+        self.activation_transform_rank = max(int(activation_rank), 0)
+        self.gradient_transform_rank = max(int(gradient_rank), 0)
+
+    def _rank_for_sequence_length(self, seq_len: int, *, gradient: bool = False) -> int:
+        configured = self.gradient_transform_rank if gradient else self.activation_transform_rank
+        if configured > 0:
+            return min(configured, seq_len)
+        return _effective_max_rank_for_dimension(seq_len, seq_len, self.config)
 
     def forward(self, x: Tensor) -> Tensor:
-        if not self._can_use_lowpass(x):
-            return F.linear(x, self.weight, self.bias)
+        use_fixed_projector = self.config.projector_kind != "svd"
+        activation_rank = self._rank_for_sequence_length(x.shape[-2]) if x.ndim >= 3 else 0
+        gradient_rank = (
+            self._rank_for_sequence_length(x.shape[-2], gradient=True)
+            if self.config.compress_gradients and x.ndim >= 3
+            else 0
+        )
+        use_lowpass = (
+            self.config.enabled
+            and not self._calibrating
+            and self.has_projectors
+            and x.ndim >= 3
+            and activation_rank > 0
+            and (
+                use_fixed_projector
+                or (
+                    x.shape[-2] == self.activation_projector.shape[1]
+                    and (
+                        not self.config.compress_gradients
+                        or x.shape[-2] == self.gradient_projector.shape[1]
+                    )
+                )
+            )
+            and (self.config.projector_kind not in {"hadamard", "haar"} or _is_power_of_two(int(x.shape[-2])))
+        )
+        if use_lowpass:
+            if not _torch_is_compiling():
+                self.lowpass_calls += 1
+            p: Tensor | None = None if use_fixed_projector else self.activation_projector
+            q: Tensor | None = None if use_fixed_projector else self.gradient_projector
+        else:
+            if not _torch_is_compiling():
+                self.fallback_calls += 1
+            p = q = None
         return _LowpassLinearFunction.apply(
             x,
             self.weight,
             self.bias,
+            p,
+            q,
+            activation_rank,
+            gradient_rank,
+            use_lowpass,
+            self.config.exact_input_grad,
+            self.config.compress_gradients,
             self.config.projector_kind,
-            self.config.keep,
         )
 
 
@@ -309,12 +674,8 @@ def make_module_filter(target: str) -> Callable[[str, torch.nn.Linear], bool] | 
     if normalized == "mlp":
         return mlp_module_filter
     if normalized in {"all", "every", "any"}:
-        return None  # None means replace every nn.Linear
+        return None
     if normalized in {"all_no_lmhead", "all_except_lmhead", "all_minus_lmhead"}:
-        # All Linears EXCEPT lm_head / embed projection — those have the
-        # vocab dimension (~248k for Qwen3.5) and compressing the input
-        # to lm_head means the grad_w for the LM head itself becomes
-        # approximate, which is the most sensitive layer in CE loss.
         return lambda name, _module: (
             "lm_head" not in name.lower() and "embed_tokens" not in name.lower()
         )
@@ -344,3 +705,183 @@ def replace_linear_with_lowpass(
 
     visit(model, "")
     return replaced
+
+
+class _CalibrationCollector:
+    def __init__(self, module_name: str, module: LowpassLinear, config: LowpassConfig) -> None:
+        self.module_name = module_name
+        self.module = module
+        self.config = config
+        self.activation_chunks: list[Tensor] = []
+        self.gradient_chunks: list[Tensor] = []
+        self.activation_columns = 0
+        self.gradient_columns = 0
+
+    def add_activation(self, x: Tensor) -> None:
+        sample = _sequence_sample_matrix(x, self.config.max_seq_len)
+        self.activation_columns = _append_sample_columns(
+            self.activation_chunks,
+            self.activation_columns,
+            sample,
+            self.config.calibration_max_columns,
+            store_on_cpu=self.config.store_calibration_on_cpu,
+        )
+
+    def add_gradient(self, grad_output: Tensor) -> None:
+        sample = _sequence_sample_matrix(grad_output, self.config.max_seq_len)
+        self.gradient_columns = _append_sample_columns(
+            self.gradient_chunks,
+            self.gradient_columns,
+            sample,
+            self.config.calibration_max_columns,
+            store_on_cpu=self.config.store_calibration_on_cpu,
+        )
+
+    def finalize(self) -> LowpassStats:
+        if not self.activation_chunks:
+            raise RuntimeError(f"no activation calibration samples captured for {self.module_name}")
+        if self.config.compress_gradients and not self.gradient_chunks:
+            raise RuntimeError(f"no gradient calibration samples captured for {self.module_name}")
+        activation_samples = torch.cat(self.activation_chunks, dim=1)
+        device = self.module.weight.device
+        projector_builder = (
+            _fixed_transform_projector if self.config.projector_kind != "svd" else _randomized_projector
+        )
+        activation_result = projector_builder(
+            activation_samples,
+            energy_threshold=self.config.activation_energy,
+            config=self.config,
+            device=device,
+        )
+        q: Tensor | None = None
+        gradient_rank = 0
+        gradient_effective_max_rank = 0
+        gradient_selected_energy = 0.0
+        gradient_cap_energy = 0.0
+        gradient_sketch_energy = 0.0
+        gradient_rank90_total = 0
+        gradient_rank95_total = 0
+        gradient_rank98_total = 0
+        gradient_rank99_total = 0
+        if self.config.compress_gradients:
+            gradient_samples = torch.cat(self.gradient_chunks, dim=1)
+            gradient_result = projector_builder(
+                gradient_samples,
+                energy_threshold=self.config.gradient_energy,
+                config=self.config,
+                device=device,
+            )
+            q = gradient_result.projector
+            gradient_rank = gradient_result.rank
+            gradient_effective_max_rank = gradient_result.effective_max_rank
+            gradient_selected_energy = gradient_result.selected_energy
+            gradient_cap_energy = gradient_result.cap_energy
+            gradient_sketch_energy = gradient_result.sketch_energy
+            gradient_rank90_total = gradient_result.rank90_total
+            gradient_rank95_total = gradient_result.rank95_total
+            gradient_rank98_total = gradient_result.rank98_total
+            gradient_rank99_total = gradient_result.rank99_total
+        if self.config.projector_kind == "svd":
+            self.module.set_projectors(activation_result.projector, q)
+        else:
+            self.module.set_transform_ranks(activation_result.rank, gradient_rank)
+        return LowpassStats(
+            module_name=self.module_name,
+            activation_rank=activation_result.rank,
+            gradient_rank=gradient_rank,
+            activation_effective_max_rank=activation_result.effective_max_rank,
+            gradient_effective_max_rank=gradient_effective_max_rank,
+            activation_columns=self.activation_columns,
+            gradient_columns=self.gradient_columns,
+            activation_selected_energy=activation_result.selected_energy,
+            activation_cap_energy=activation_result.cap_energy,
+            activation_sketch_energy=activation_result.sketch_energy,
+            activation_rank90_total=activation_result.rank90_total,
+            activation_rank95_total=activation_result.rank95_total,
+            activation_rank98_total=activation_result.rank98_total,
+            activation_rank99_total=activation_result.rank99_total,
+            gradient_selected_energy=gradient_selected_energy,
+            gradient_cap_energy=gradient_cap_energy,
+            gradient_sketch_energy=gradient_sketch_energy,
+            gradient_rank90_total=gradient_rank90_total,
+            gradient_rank95_total=gradient_rank95_total,
+            gradient_rank98_total=gradient_rank98_total,
+            gradient_rank99_total=gradient_rank99_total,
+            fallback_calls=int(self.module.fallback_calls.detach().cpu()),
+        )
+
+
+def _try_finalize_collector(collector: _CalibrationCollector) -> LowpassStats | None:
+    if not collector.activation_chunks:
+        return None
+    if collector.config.compress_gradients and not collector.gradient_chunks:
+        return None
+    return collector.finalize()
+
+
+def _lowpass_modules(model: torch.nn.Module) -> dict[str, LowpassLinear]:
+    return {name: module for name, module in model.named_modules() if isinstance(module, LowpassLinear)}
+
+
+def calibrate_lowpass(
+    model: torch.nn.Module,
+    batches: Iterable[Any],
+    loss_fn: Callable[[torch.nn.Module, Any], Tensor],
+    *,
+    steps: int,
+    config: LowpassConfig | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> list[LowpassStats]:
+    lowpass_config = config or LowpassConfig()
+    modules = _lowpass_modules(model)
+    if not modules:
+        return []
+
+    collectors = {
+        name: _CalibrationCollector(name, module, lowpass_config)
+        for name, module in modules.items()
+    }
+    hooks: list[torch.utils.hooks.RemovableHandle] = []
+    old_flags = {module: module._calibrating for module in modules.values()}
+    for module in modules.values():
+        module._calibrating = True
+
+    def make_hook(name: str) -> Callable[[torch.nn.Module, tuple[Any, ...], Any], None]:
+        def hook(_module: torch.nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
+            if not inputs or not isinstance(inputs[0], Tensor) or not isinstance(output, Tensor):
+                return
+            collectors[name].add_activation(inputs[0])
+            if lowpass_config.compress_gradients and output.requires_grad:
+                output.register_hook(lambda grad, module_name=name: collectors[module_name].add_gradient(grad))
+
+        return hook
+
+    try:
+        for name, module in modules.items():
+            hooks.append(module.register_forward_hook(make_hook(name)))
+
+        for index, batch in enumerate(batches):
+            if index >= steps:
+                break
+            model.zero_grad(set_to_none=True)
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model, batch)
+            if not isinstance(loss, Tensor) or loss.ndim != 0:
+                raise ValueError("loss_fn must return a scalar torch.Tensor")
+            loss.backward()
+    finally:
+        for hook in hooks:
+            hook.remove()
+        for module, flag in old_flags.items():
+            module._calibrating = flag
+        model.zero_grad(set_to_none=True)
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+
+    stats: list[LowpassStats] = []
+    for collector in collectors.values():
+        finalized = _try_finalize_collector(collector)
+        if finalized is not None:
+            stats.append(finalized)
+    return stats

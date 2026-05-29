@@ -41,8 +41,10 @@ DEFAULT_LOCATION = os.environ.get("VERTEXAI_LOCATION", "global")
 
 # Diverse topic prompts to avoid repetitive corpus. The model is told to write
 # fresh prose in the conlang, no English. ~50 unique seeds; randomly sampled
-# per chunk request.
-TOPIC_SEEDS = [
+# per chunk request. Split into TRAIN and HELDOUT so a held-out generalization
+# eval corpus can be generated from the SAME grammar but DISJOINT topics
+# (--topic-set heldout), making the eval topic-OOD rather than just seed-OOD.
+TRAIN_TOPIC_SEEDS = [
     "a description of a village at dawn",
     "a hunter tracking prey through a forest",
     "a parent telling a child a folk tale at night",
@@ -93,6 +95,41 @@ TOPIC_SEEDS = [
     "a description of a wedding feast lasting all night",
     "a hunter sharing meat with their family at the end of the day",
     "a description of the wind blowing through tall reeds",
+]
+
+# Disjoint from TRAIN_TOPIC_SEEDS — used only for the held-out eval corpus so the
+# generalization metric is measured on topics never seen during training.
+HELDOUT_TOPIC_SEEDS = [
+    "a blacksmith forging a tool over a hot fire",
+    "a description of a desert at the hottest hour of the day",
+    "a traveler lost in fog trying to find the way back",
+    "a grandmother teaching a grandchild to weave cloth",
+    "a description of a waterfall heard from far away",
+    "two rivals competing in a footrace before a crowd",
+    "a healer gathering herbs to treat a sick child",
+    "a description of an eclipse and the fear it brings",
+    "a shepherd counting a flock at the end of the day",
+    "a description of a bridge built across a deep ravine",
+    "a potter teaching an apprentice to shape clay",
+    "a description of frost forming on grass at dawn",
+    "a sailor describing a strange coast seen from the water",
+    "a council debating how to share a poor harvest",
+    "a description of bees building a hive in a hollow tree",
+    "a child afraid of thunder being comforted by a parent",
+    "a description of a dye made from crushed berries",
+    "two friends repairing a roof after a storm",
+    "a description of a herd of animals migrating across a plain",
+    "a person teaching another to read the tracks of animals",
+    "a description of a spring bubbling up from rock",
+    "a feast prepared to welcome a returning traveler",
+    "a description of a loom and the cloth woven on it",
+    "a quarrel between neighbors over a shared well",
+    "a description of an owl hunting in the dark",
+    "a person learning to swim in a cold lake",
+    "a description of salt gathered from a dried shore",
+    "an old hunter passing a bow to a younger one",
+    "a description of a comet crossing the night sky",
+    "a group digging a channel to bring water to a field",
 ]
 
 CHUNK_INSTRUCTION = (
@@ -153,7 +190,27 @@ def parse_lexicon_words(lexicon_csv: str) -> list[str]:
     return words
 
 
-def load_spec(language_id: str | None) -> ConlangSpec:
+def is_latin_script(lexicon_csv: str) -> bool:
+    """Heuristic: the lexicon surface forms are predominantly ASCII letters.
+
+    The synthetic-conlang loss floor is partly a tokenizer artifact — Qwen
+    shreds IPA / tone marks into predictable sub-character pieces. A Latin-script
+    language tokenizes into fewer, larger pieces, so it has a higher baseline
+    loss and is harder to fit. (See docs/foreign-cpt-findings.md.)
+    """
+    words = parse_lexicon_words(lexicon_csv)
+    alpha = [c for w in words for c in w if c.isalpha()]
+    if not alpha:
+        return False
+    ascii_frac = sum(1 for c in alpha if ord(c) < 128) / len(alpha)
+    return ascii_frac > 0.9
+
+
+def load_spec(
+    language_id: str | None,
+    min_lexicon_words: int = 0,
+    latin_script: bool = False,
+) -> ConlangSpec:
     ds = load_dataset(CONLANG_DATASET, split="test")
     if language_id:
         row = next((r for r in ds if r["language_id"] == language_id), None)
@@ -161,10 +218,23 @@ def load_spec(language_id: str | None) -> ConlangSpec:
             ids = [r["language_id"] for r in ds][:10]
             raise SystemExit(f"language_id {language_id!r} not found. Sample ids: {ids}")
     else:
-        # Default: pick a DeepSeek-R1 spec with a long lexicon.
-        cands = [r for r in ds if r["model"] == "DeepSeek-R1"]
+        # Default: pick a DeepSeek-R1 spec with a long lexicon. With filters, pick
+        # the longest-lexicon spec satisfying them (harder = larger lexicon and/or
+        # Latin script for a higher tokenizer baseline).
+        cands = list(ds)
+        if latin_script:
+            cands = [r for r in cands if is_latin_script(r["lexicon"])]
+        else:
+            cands = [r for r in cands if r["model"] == "DeepSeek-R1"]
+        if min_lexicon_words > 0:
+            cands = [r for r in cands if len(parse_lexicon_words(r["lexicon"])) >= min_lexicon_words]
+        if not cands:
+            raise SystemExit(
+                f"no spec matched filters (latin_script={latin_script}, "
+                f"min_lexicon_words={min_lexicon_words}); relax the constraints"
+            )
         cands.sort(key=lambda r: len(r["lexicon"]), reverse=True)
-        row = cands[0] if cands else ds[0]
+        row = cands[0]
     words = parse_lexicon_words(row["lexicon"])
     return ConlangSpec(
         language_id=row["language_id"],
@@ -221,6 +291,42 @@ def lexicon_overlap(text: str, lexicon_roots: list[str]) -> float:
                 hits += 1
                 break
     return hits / max(len(words), 1)
+
+
+def inject_typos(text: str, rate: float, rng: random.Random) -> str:
+    """Perturb characters at `rate` to make the corpus harder to memorize.
+
+    Substitutions draw from the chunk's own character set, so typos stay in the
+    conlang's script (no foreign characters introduced). Operations: delete,
+    duplicate, substitute, transpose. Applied AFTER the quality gate so overlap
+    is measured on clean text. Note: typos add irreducible entropy — they raise
+    the loss floor and break rote string memorization, but part of the added
+    difficulty is noise rather than deeper structure. Keep the rate modest
+    (~1-3%). Do NOT apply to the held-out eval corpus.
+    """
+    if rate <= 0.0 or not text:
+        return text
+    alphabet = list(set(text))
+    out: list[str] = []
+    for ch in text:
+        if rng.random() < rate:
+            op = rng.randint(0, 3)
+            if op == 0:  # delete
+                continue
+            if op == 1:  # duplicate
+                out.append(ch)
+                out.append(ch)
+                continue
+            if op == 2:  # substitute with another char from the same script
+                out.append(rng.choice(alphabet))
+                continue
+            # transpose with the previously emitted char
+            if out:
+                out[-1], ch = ch, out[-1]
+            out.append(ch)
+            continue
+        out.append(ch)
+    return "".join(out)
 
 
 @dataclass
@@ -303,10 +409,14 @@ async def run_loop(
     concurrency: int,
     gate: QualityGate,
     output_jsonl: Path,
+    topic_seeds: list[str],
+    seed: int = 1337,
+    typo_rate: float = 0.0,
     max_retries: int = 2,
     debug_dir: Path | None = None,
     debug_first_n: int = 3,
 ) -> dict:
+    random.seed(seed)
     lexicon_roots = list(spec.lexicon_words)
     semaphore = asyncio.Semaphore(concurrency)
     if debug_dir is not None:
@@ -342,7 +452,7 @@ async def run_loop(
 
     def schedule_one():
         nonlocal next_chunk_id
-        topic = random.choice(TOPIC_SEEDS)
+        topic = random.choice(topic_seeds)
         task = asyncio.create_task(
             generate_one(client, model, spec, topic, target_chars_per_chunk, semaphore)
         )
@@ -385,7 +495,7 @@ async def run_loop(
                 if task.attempts < max_retries:
                     # Retry with a different topic seed.
                     task.attempts += 1
-                    new_topic = random.choice(TOPIC_SEEDS)
+                    new_topic = random.choice(topic_seeds)
                     retry = asyncio.create_task(
                         generate_one(client, model, spec, new_topic, target_chars_per_chunk, semaphore)
                     )
@@ -399,7 +509,11 @@ async def run_loop(
                     schedule_one()
                 continue
 
-            # Accept
+            # Accept. Inject typos AFTER the gate passed (gate measured clean
+            # text). Seed per-chunk so the corruption is reproducible across
+            # resumes regardless of completion order.
+            if typo_rate > 0.0:
+                text = inject_typos(text, typo_rate, random.Random((seed, task.chunk_id)))
             row = {
                 "text": text,
                 "topic": task.topic,
@@ -489,6 +603,35 @@ def main() -> None:
     p.add_argument("--min-chars", type=int, default=400)
     p.add_argument("--max-retries", type=int, default=2)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    p.add_argument("--seed", type=int, default=1337, help="RNG seed for topic sampling and typo injection")
+    p.add_argument(
+        "--topic-set",
+        choices=("train", "heldout"),
+        default="train",
+        help="train = TRAIN_TOPIC_SEEDS; heldout = disjoint HELDOUT_TOPIC_SEEDS for the generalization eval corpus",
+    )
+    p.add_argument(
+        "--variant",
+        default="",
+        help="Suffix appended to the output dir (e.g. 'heldout', 'typo2') so variants of the same language_id don't collide",
+    )
+    p.add_argument(
+        "--min-lexicon-words",
+        type=int,
+        default=0,
+        help="When auto-selecting a spec, require at least this many lexicon words (harder = larger lexicon)",
+    )
+    p.add_argument(
+        "--latin-script",
+        action="store_true",
+        help="Auto-select a Latin-script spec (higher tokenizer baseline, harder to fit) instead of the default IPA spec",
+    )
+    p.add_argument(
+        "--typo-rate",
+        type=float,
+        default=0.02,
+        help="Per-character corruption rate applied AFTER the quality gate (train only). Default 0.02 is the canonical harder-corpus setting; pass 0 to disable. Forced to 0 for --topic-set heldout (the eval corpus stays clean).",
+    )
     p.add_argument("--smoke", action="store_true", help="Tiny run: ~50k chars, conc=4")
     args = p.parse_args()
 
@@ -496,11 +639,24 @@ def main() -> None:
         args.target_tokens = 50_000
         args.concurrency = 4
 
+    if args.topic_set == "heldout" and args.typo_rate > 0.0:
+        # The held-out eval corpus must stay clean, otherwise the generalization
+        # metric would be measuring tolerance to noise rather than the language.
+        print(
+            f"[info] --topic-set heldout: forcing --typo-rate 0 (was {args.typo_rate}); "
+            "the held-out eval corpus is kept clean.",
+            file=sys.stderr,
+        )
+        args.typo_rate = 0.0
+
+    topic_seeds = TRAIN_TOPIC_SEEDS if args.topic_set == "train" else HELDOUT_TOPIC_SEEDS
+
     print(f"loading conlang spec from {CONLANG_DATASET}…")
-    spec = load_spec(args.language_id)
+    spec = load_spec(args.language_id, min_lexicon_words=args.min_lexicon_words, latin_script=args.latin_script)
     print(f"  language_id={spec.language_id}  generator={spec.model}  lexicon_words={len(spec.lexicon_words)}")
 
-    output_dir = args.output_dir / spec.language_id
+    dir_name = spec.language_id + (f"_{args.variant}" if args.variant else "")
+    output_dir = args.output_dir / dir_name
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "chunks.jsonl"
     parquet_path = output_dir / "train.parquet"
@@ -528,6 +684,7 @@ def main() -> None:
     print(f"target: {args.target_tokens:,} output tokens (stop on token count)")
     print(f"concurrency: {args.concurrency}  chunk_chars: {args.chunk_chars}")
     print(f"quality gate: min_chars={gate.min_chars} min_lex_overlap={gate.min_lex_overlap} max_english_ratio={gate.max_english_ratio}")
+    print(f"topic_set={args.topic_set} ({len(topic_seeds)} seeds)  seed={args.seed}  typo_rate={args.typo_rate}  variant={args.variant or '-'}")
 
     summary = asyncio.run(
         run_loop(
@@ -539,6 +696,9 @@ def main() -> None:
             concurrency=args.concurrency,
             gate=gate,
             output_jsonl=jsonl_path,
+            topic_seeds=topic_seeds,
+            seed=args.seed,
+            typo_rate=args.typo_rate,
             max_retries=args.max_retries,
             debug_dir=output_dir / "debug",
             debug_first_n=5,
@@ -558,6 +718,12 @@ def main() -> None:
         "target_tokens": args.target_tokens,
         "chunk_chars": args.chunk_chars,
         "concurrency": args.concurrency,
+        "seed": args.seed,
+        "topic_set": args.topic_set,
+        "variant": args.variant,
+        "typo_rate": args.typo_rate,
+        "min_lexicon_words": args.min_lexicon_words,
+        "latin_script": args.latin_script,
     }
     summary_path.write_text(json.dumps(summary_full, indent=2, ensure_ascii=False), encoding="utf-8")
     print("\n=== summary ===")

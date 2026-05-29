@@ -8,7 +8,10 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
+import sys
 import unittest
 from pathlib import Path
 
@@ -18,9 +21,124 @@ import main
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _load_synth_module():
+    """Load scripts/synthesize_conlang_cpt.py as a module.
+
+    Registered in sys.modules before exec so @dataclass introspection (which
+    reads cls.__module__ from sys.modules) works.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "synthesize_conlang_cpt", ROOT / "scripts" / "synthesize_conlang_cpt.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class CptTextFieldDefaultTest(unittest.TestCase):
     def test_default_is_text(self) -> None:
         self.assertEqual(main.DEFAULT_CPT_TEXT_FIELD, "text")
+
+
+class HeldoutEvalDefaultsTest(unittest.TestCase):
+    """The held-out eval feature must be OFF by default so existing runs and
+    cached eval tensors are unaffected."""
+
+    def test_constants_default_disabled(self) -> None:
+        self.assertEqual(main.DEFAULT_HELDOUT_EVAL_DATASET_ID, "")
+        self.assertEqual(main.DEFAULT_HELDOUT_EVAL_DATASET_CONFIG, "")
+        self.assertEqual(main.DEFAULT_HELDOUT_EVAL_DATASET_REVISION, "")
+        self.assertEqual(main.DEFAULT_HELDOUT_EVAL_SPLIT, "train")
+
+
+class CptEvalKeyPayloadTest(unittest.TestCase):
+    """The eval-cache key must be byte-identical to the legacy one when no
+    held-out corpus is active (so old caches/records stay valid), and must
+    change when a held-out corpus is set."""
+
+    BASE = dict(
+        model_id="m",
+        model_revision="r",
+        dataset_id="d",
+        dataset_config="",
+        dataset_revision="rev",
+        seq_len=4096,
+        eval_blocks=64,
+        seed=1337,
+        cpt_text_field="text",
+        pack_align=1,
+    )
+
+    def _key(self, payload: dict) -> str:
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:20]
+
+    def test_disabled_matches_legacy_payload(self) -> None:
+        # The exact legacy dict that produced the v2 records' cache keys.
+        legacy = {
+            "model": "m",
+            "model_revision": "r",
+            "dataset": "d",
+            "dataset_config": "",
+            "dataset_revision": "rev",
+            "seq_len": 4096,
+            "eval_blocks": 64,
+            "sequence_packing": main.DEFAULT_SEQUENCE_PACKING,
+            "packing_strategy": main.DEFAULT_PACKING_STRATEGY,
+            "seed": 1337,
+            "kind": "all_token_cpt_packed_v3_docaware",
+            "text_field": "text",
+            "pack_align": 1,
+        }
+        produced = main._cpt_eval_key_payload(**self.BASE)
+        self.assertEqual(produced, legacy)
+        self.assertEqual(self._key(produced), self._key(legacy))
+
+    def test_heldout_changes_key(self) -> None:
+        disabled = main._cpt_eval_key_payload(**self.BASE)
+        enabled = main._cpt_eval_key_payload(
+            **self.BASE,
+            heldout_eval_active=True,
+            heldout_eval_dataset_id="someuser/heldout",
+            heldout_eval_dataset_revision="abc",
+        )
+        self.assertNotEqual(self._key(disabled), self._key(enabled))
+        self.assertEqual(enabled["kind"], "all_token_cpt_packed_v4_heldout")
+        self.assertEqual(enabled["heldout_eval_dataset"], "someuser/heldout")
+
+    def test_inactive_flag_ignores_heldout_id(self) -> None:
+        # Passing a held-out id but active=False must NOT change the key.
+        disabled = main._cpt_eval_key_payload(**self.BASE)
+        still_disabled = main._cpt_eval_key_payload(
+            **self.BASE,
+            heldout_eval_active=False,
+            heldout_eval_dataset_id="someuser/heldout",
+        )
+        self.assertEqual(self._key(disabled), self._key(still_disabled))
+
+
+class GeneratorHardeningTest(unittest.TestCase):
+    """The synthesis script's harder-task knobs exist and behave."""
+
+    def test_topic_sets_disjoint(self) -> None:
+        mod = _load_synth_module()
+        train = set(mod.TRAIN_TOPIC_SEEDS)
+        heldout = set(mod.HELDOUT_TOPIC_SEEDS)
+        self.assertTrue(train)
+        self.assertTrue(heldout)
+        self.assertEqual(train & heldout, set(), "train and heldout topics must be disjoint")
+
+    def test_inject_typos_changes_text_deterministically(self) -> None:
+        import random as _random
+
+        mod = _load_synth_module()
+        text = "kʼu hun waˈla " * 50
+        # rate 0 is a no-op
+        self.assertEqual(mod.inject_typos(text, 0.0, _random.Random(0)), text)
+        a = mod.inject_typos(text, 0.1, _random.Random(123))
+        b = mod.inject_typos(text, 0.1, _random.Random(123))
+        self.assertEqual(a, b, "same seed -> same corruption")
+        self.assertNotEqual(a, text, "typos should change the text")
 
 
 class LocalConlangParquetTest(unittest.TestCase):

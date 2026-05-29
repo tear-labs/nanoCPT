@@ -120,7 +120,12 @@ def size_category(n_rows: int) -> str:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("source_dir", type=Path, help="Directory containing train.parquet, spec.md, synthesis_summary.json")
-    p.add_argument("--repo-name", default=None, help="Repo name (default: conlangcrafter-cpt-<language_id>)")
+    p.add_argument("--repo-name", default=None, help="Repo name (default: conlangcrafter-cpt-<language_id>[-<suffix>])")
+    p.add_argument(
+        "--repo-suffix",
+        default="",
+        help="Suffix appended to the default repo name (e.g. 'heldout', 'typo2') so train/heldout/variant corpora get distinct repos",
+    )
     p.add_argument("--user", default=None, help="HF user/org (default: from whoami)")
     p.add_argument("--private", action="store_true", help="Create as private repo")
     p.add_argument("--dry-run", action="store_true", help="Print plan only, do not upload")
@@ -143,7 +148,9 @@ def main() -> None:
     pf = pq.ParquetFile(parquet_path)
     n_rows = pf.metadata.num_rows
 
-    repo_name = args.repo_name or f"conlangcrafter-cpt-{language_id}"
+    repo_name = args.repo_name or (
+        f"conlangcrafter-cpt-{language_id}" + (f"-{args.repo_suffix}" if args.repo_suffix else "")
+    )
     user = args.user
     if not user:
         info = whoami()

@@ -70,21 +70,30 @@ edits before launching long ablations.
 
 ## Maximize VRAM utilization
 
-The H100 has 80 GiB (SXM5) or 94 GiB (NVL). A correct Track 2 config should
-push `peak_cuda_memory_allocated_gib` close to **the full VRAM** — anywhere
-below ~95 % means we're leaving training capacity on the table. Idle VRAM
-is wasted activations, which is wasted tokens-per-step, which is wasted
-loss drop in the fixed budget.
+The H100 has 80 GiB (SXM5) or 94 GiB (NVL). Modal schedules either SKU for
+`gpu="H100"`, so to keep runs comparable the allocator is capped to a fixed
+byte budget — `--vram-fraction` (default 0.92) of the 80 GiB reference, i.e.
+**~72.8 GiB on every card** (see `compute_vram_fraction` in `main.py`). The
+applied fraction and budget are recorded in `summary.json` as
+`vram_fraction_applied` / `vram_budget_gib`.
 
-If a run lands at e.g. 54 GiB on an 80 GiB card, that's ~25 GiB of unused
-activation room — bump `--seq-len`, `--micro-batch-size`, or enable
-features that trade memory for tokens (`--lowpass --gradient-checkpointing
-false`, `--optimizer-name adamw8bit` to free optimizer state, etc.) until
-the next run trips OOM, then back off one notch.
+A correct Track 2 config should push `peak_cuda_memory_allocated_gib` close
+to that **budget** (~72.8 GiB), not the raw card. Idle VRAM is wasted
+activations, which is wasted tokens-per-step, which is wasted loss drop in
+the fixed budget.
+
+If a run lands at e.g. 54 GiB, that's ~19 GiB of unused activation room —
+bump `--seq-len`, `--micro-batch-size`, or enable features that trade memory
+for tokens (`--lowpass --gradient-checkpointing false`, `--optimizer-name
+adamw8bit` to free optimizer state, etc.) until the next run trips OOM, then
+back off one notch. (To deliberately use a full 94 GiB NVL card, raise
+`--vram-fraction`; the default keeps SKUs interchangeable.)
 
 Goal: every accepted record's `summary.json` should have
-`peak_cuda_memory_allocated_fraction ≥ 0.95`. Anything lower is a sign
-the config hasn't been pushed.
+`peak_cuda_memory_allocated_gib` close to `vram_budget_gib` (≈ the cap).
+Note `peak_cuda_memory_allocated_fraction` is measured against the raw card,
+so on a 94 GiB NVL it reads ~0.77 even at a full budget — judge against the
+budget, not the raw fraction.
 
 ## Document-aware packed sequences (don't leak across boundaries)
 
