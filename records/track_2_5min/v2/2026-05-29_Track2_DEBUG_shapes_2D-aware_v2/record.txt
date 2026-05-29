@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 DEBUG shapes 2D-aware v2
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.647483
+Baseline eval loss: 1.015397
+Final eval loss: 0.367914
+Steps: 72
+Tokens: 2,359,296
+Supervised tokens: 2,339,958
+Eval supervised tokens: 260,165
+Compile + warmup (untimed): 244.5s
+Elapsed budget: 302.4s
+Budget tokens/sec: 7802
+Train-loop elapsed: 302.4s
+Train-loop tokens/sec: 7802

@@ -301,21 +301,35 @@ def _make_pack_unpack(config: LowpassConfig, seq_len: int):
         # Conservative filter: only compress tensors that look like
         # [batch, seq, hidden] hidden states. Skip everything else
         # (parameter leaves, scalars, attention masks, kv caches, etc.).
-        # Only compress the canonical [batch, seq, hidden] residual/MLP
-        # shape. Higher-rank shapes (attention scores [B,H,S,S], KV cache
-        # [B,H,S,D], etc.) get falsely matched if we permit ndim>3 — those
-        # tensors don't behave well under per-token Hadamard projection.
+        # Accept two shapes:
+        #   [batch, seq, hidden]  — canonical residual/MLP layout (ndim==3)
+        #   [batch*seq, hidden]   — flattened layout commonly used inside
+        #                           fused MLP/attention kernels (ndim==2)
+        # Reject higher-rank shapes ([B,H,S,S] attention scores, etc.) which
+        # don't behave well under per-token Hadamard projection.
         if (
             not config.enabled
             or not tensor.is_cuda
             or not tensor.is_floating_point()
-            or tensor.ndim != 3
+            or tensor.ndim not in (2, 3)
             or tensor.shape[-1] < min_hidden_dim
             or (max_hidden_dim > 0 and tensor.shape[-1] > max_hidden_dim)
-            or tensor.shape[1] not in expected_token_axes
         ):
             return tensor
-        token_axis = 1
+        if tensor.ndim == 3:
+            if tensor.shape[1] not in expected_token_axes:
+                return tensor
+            token_axis = 1
+        else:
+            # 2D: shape[0] should be a multiple of seq_len. We reshape to
+            # 3D [batch, seq, hidden] before projecting.
+            if tensor.shape[0] % seq_len != 0:
+                return tensor
+            implied_batch = tensor.shape[0] // seq_len
+            if implied_batch < 1 or implied_batch > 64:
+                return tensor
+            tensor = tensor.reshape(implied_batch, seq_len, tensor.shape[1])
+            token_axis = 1
         token_count = int(tensor.shape[token_axis])
         if token_count < chunk_size or token_count % chunk_size != 0:
             return tensor
@@ -365,12 +379,13 @@ def _make_pack_unpack(config: LowpassConfig, seq_len: int):
         ) = packed
         with torch.no_grad(), torch.autocast("cuda", enabled=False):
             chunks = _reconstruct_chunks(lowpass, chunk_size, projector_kind)
-            prefix_numel = int(math.prod(prefix_shape))
             n_chunks = token_count // chunk_size
             suffix_numel = int(math.prod(suffix_shape))
-            restored = chunks.reshape(prefix_numel, n_chunks * chunk_size, suffix_numel)
-            restored = restored.reshape(*prefix_shape, token_count, *suffix_shape)
-            return restored.reshape(original_shape).to(original_dtype)
+            # `chunks` has shape [prefix_numel * n_chunks, chunk_size, suffix_numel].
+            # Restore to the ORIGINAL tensor shape via reshape (handles both
+            # ndim==2 flattened and ndim==3 layouts correctly).
+            restored = chunks.reshape(original_shape)
+            return restored.to(original_dtype)
 
     return pack, unpack
 

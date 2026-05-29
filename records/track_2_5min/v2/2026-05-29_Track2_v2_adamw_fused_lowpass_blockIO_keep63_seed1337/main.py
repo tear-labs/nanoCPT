@@ -994,18 +994,7 @@ def run_track1(
     def set_gradient_checkpointing(current_model: torch.nn.Module, enabled: bool) -> None:
         if enabled:
             if hasattr(current_model, "gradient_checkpointing_enable"):
-                # use_reentrant=False is required for `saved_tensors_hooks`
-                # installed by the lowpass context to see saves that happen
-                # inside the per-block checkpoint recompute. Reentrant mode
-                # runs the recompute in a separate autograd context that
-                # bypasses our outer hooks, so the MLP intermediate etc.
-                # never reach pack/unpack.
-                try:
-                    current_model.gradient_checkpointing_enable(
-                        gradient_checkpointing_kwargs={"use_reentrant": False}
-                    )
-                except TypeError:
-                    current_model.gradient_checkpointing_enable()
+                current_model.gradient_checkpointing_enable()
             return
         if hasattr(current_model, "gradient_checkpointing_disable"):
             current_model.gradient_checkpointing_disable()

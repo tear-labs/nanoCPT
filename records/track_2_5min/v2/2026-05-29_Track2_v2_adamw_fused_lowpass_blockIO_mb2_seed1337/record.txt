@@ -1,0 +1,20 @@
+Track 2 (5min)
+Description: Track2 v2 adamw_fused lowpass blockIO mb2 seed1337
+Contributors: @levstamb
+Date: 2026-05-29
+Data mode: cpt
+Loss mask: all_tokens
+Sequence packing: True (stream_concat_no_padding)
+Minutes: 5.0
+Eval loss drop: 0.292958
+Baseline eval loss: 1.015397
+Final eval loss: 0.722438
+Steps: 96
+Tokens: 3,145,728
+Supervised tokens: 3,119,822
+Eval supervised tokens: 260,165
+Compile + warmup (untimed): 249.9s
+Elapsed budget: 302.5s
+Budget tokens/sec: 10400
+Train-loop elapsed: 302.5s
+Train-loop tokens/sec: 10400
